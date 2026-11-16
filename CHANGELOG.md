@@ -42,6 +42,16 @@
   → wp-config 常量」顺序排查。实测 `enable` → `index, follow, max-snippet:-1` + 6 张子 sitemap，
   `disable` → `noindex, nofollow` + 空 sitemap，可完整还原。
 
+### 文档修正与实测（2026-11-16 补）
+- **纠正「默认新站没有对象缓存」的错误描述**：`wp-cluster add` 实际会写 `apcm_earlyloading=1`，
+  `apcu-manager` 在新站首次 Web 请求时自动安装 `object-cache.php` drop-in，APCu 默认接管 WP 对象缓存。
+  README / `docs/TECH-STACK.md` / `docs/ARCHITECTURE.md` 里「apcu-manager 只作统计面板」「默认新站没有这层」
+  等表述已改正；`SQLite Object Cache` 仍未安装、不属于本方案。
+- **补做对象缓存开 / 关 A/B/C 实测**：无对象缓存 / APCu drop-in / LSCache+Redis 三组，两轮反向顺序、
+  探针自证分组，完整数据见 `docs/TECH-STACK.md` 第 6 节。结论：动态路径下 APCu 相对无缓存串行 RPS +26%、
+  并发 p95 −38%；Redis 与 APCu 基本持平却要多一个常驻服务，因此维持「LSCache 对象缓存模块关闭」。
+  测试用的临时站、Redis 包、探针已全部清理，6 站 HTTP 200、`doctor` 全项通过。
+
 ### 变更
 - `SELF_UPDATE_URL` 默认值改为空，交由 `resolve_update_url()` 解析；默认指向
   `jiaoben123/wp-cluster@main`。

@@ -17,7 +17,7 @@
 ┌───────────────────▼───────────────────────────┐
 │ LSPHP 8.3（按需拉起工作进程）                   │
 │  opcache（字节码）+ APCu 扩展（128M）           │
-│  注：默认无 object-cache.php，APCu 不接管 WP 对象缓存 │
+│  注：新建站默认由 apcu-manager 装 object-cache.php，APCu 接管 WP 对象缓存 │
 └───────────────────┬───────────────────────────┘
                     │ PDO
 ┌───────────────────▼───────────────────────────┐
@@ -31,13 +31,14 @@
 |---|---|---|---|
 | HTTP 整页 | LSCache（OLS 模块 + 插件） | 匿名访客的完整 HTML | TTL / purge / 内容更新 |
 | PHP 字节码 | Zend OPcache | PHP 脚本编译结果 | 进程重启 / 文件变更 |
-| PHP 对象 | APCu（**仅当站点有 `object-cache.php` drop-in**） | 单站点进程内对象 | 进程重启 / **Web 侧** `wp_cache_flush` |
+| PHP 对象 | APCu（新建站默认装 `object-cache.php` drop-in） | 单站点进程内对象 | 进程重启 / **Web 侧** `wp_cache_flush` |
 | 数据库 | SQLite | 持久化 | — |
 
-> **默认新站没有对象缓存 drop-in**：安装器只装 `litespeed-cache` + `apcu-manager`（统计面板），
-> 不装 Redis/Memcached、不启用 `apcu-manager` 的 `object-cache.php`。LSCache 的「对象缓存」模块
-> 因此保持默认关闭。导入站若自带该 drop-in，注意 wp-cli 与 Web 的 APCu 不共享 ——
-> 详见 [TECH-STACK.md](TECH-STACK.md) 第 5 节。
+> **两层不同的「对象缓存」别混淆**：APCu 这层由 `wp-cluster add` 写入 `apcm_earlyloading=1`，新站首次 Web 请求即自动安装 drop-in，**默认开启**；
+> LSCache 设置页里那个依赖 Redis / Memcached 的「对象缓存」模块**默认关闭**（代码注释：避免与 APCu 冲突），本机也不装 Redis / Memcached。
+> 早期站 site1–4 未设该 option，因此没有 drop-in；导入站 ww2 / 旧模板 t1 有。
+> 改 option 时 wp-cli 与 Web 的 APCu 不共享，需在 Web 侧失效缓存，详见 [TECH-STACK.md](TECH-STACK.md) 第 5 节；
+> 开 / 关的实测数据见第 6 节。
 
 ## 单站隔离边界
 
@@ -60,8 +61,8 @@
 2. OLS 查 LSCache：命中则直接返回 HTML，**不进入 PHP**（这是低配机能带多站的关键）；
 3. 未命中则转 LSPHP：`wp-load.php` → SQLite drop-in → 渲染；
 4. 响应带回 `X-LiteSpeed-Cache-Control`，OLS 存缓存；
-5. OPcache 复用编译结果；若该站装了 `object-cache.php` drop-in，APCu 再在 PHP 进程内缓存对象/选项，
-   减少 SQLite 查询（默认新站没有这层）。
+5. OPcache 复用编译结果；APCu 在 PHP 进程内缓存对象/选项，减少 SQLite 查询（新建站默认有这层，
+   实测动态路径收益见 [TECH-STACK.md](TECH-STACK.md) 第 6 节）。
 
 ## 状态模型
 

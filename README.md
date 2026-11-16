@@ -4,8 +4,9 @@
 
 技术栈：**OpenLiteSpeed + LSCache 整页缓存 + LSPHP 8.3（OPcache / APCu）+ 每站独立 SQLite**，
 非 Docker；外层可选 **Cloudflare 优选 IP**（纯控制台配置，服务器不装东西）。
-LSCache 的「对象缓存」默认是关的（本机不装 Redis / Memcached），`apcu-manager` 只作统计面板、
-不启用 `object-cache.php` drop-in。完整速查见 [docs/TECH-STACK.md](docs/TECH-STACK.md)。
+新建站默认启用 **APCu 对象缓存**（`apcu-manager` 写入 `apcm_earlyloading=1`，首次 Web 请求自动安装 `object-cache.php` drop-in）；
+**LSCache 自带的 Redis / Memcached 对象缓存模块保持关闭**——本机 A/B/C 实测显示再开 Redis 不比 APCu 快，反而多一个常驻服务。
+完整速查与实测数据见 [docs/TECH-STACK.md](docs/TECH-STACK.md)。
 不是 WordPress Multisite —— 每站独立的目录、数据库、缓存盐、vhost，互不影响。
 
 ```
