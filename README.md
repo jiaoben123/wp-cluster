@@ -2,7 +2,10 @@
 
 在一台低配 VPS 上批量部署**互相独立**的 WordPress 站点，并为每站提供完整的运维生命周期（建站 → 健康检查 → 备份 → 恢复 → 升级 → 删除）。
 
-技术栈：**OpenLiteSpeed + LSPHP 8.3 + SQLite + APCu + LSCache**，可选 Cloudflare。
+技术栈：**OpenLiteSpeed + LSCache 整页缓存 + LSPHP 8.3（OPcache / APCu）+ 每站独立 SQLite**，
+非 Docker；外层可选 **Cloudflare 优选 IP**（纯控制台配置，服务器不装东西）。
+LSCache 的「对象缓存」默认是关的（本机不装 Redis / Memcached），`apcu-manager` 只作统计面板、
+不启用 `object-cache.php` drop-in。完整速查见 [docs/TECH-STACK.md](docs/TECH-STACK.md)。
 不是 WordPress Multisite —— 每站独立的目录、数据库、缓存盐、vhost，互不影响。
 
 ```
@@ -306,6 +309,7 @@ PHP 池隔离与撤销、guard 巡检、锁冲突、删除后残留检查。
 
 | 文档 | 内容 |
 |---|---|
+| [docs/TECH-STACK.md](docs/TECH-STACK.md) | **技术栈速查**：装了什么、缓存三层的真实边界、对象缓存到底开没开、CF 优选定位、APCu 缓存坑 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 设计取舍、状态机、失败回滚 |
 | [docs/DOCKER-VS-NATIVE.md](docs/DOCKER-VS-NATIVE.md) | 为什么不用 Docker（含实测数据） |
 | [docs/FAULT-ISOLATION.md](docs/FAULT-ISOLATION.md) | **故障隔离**：共享边界、故障矩阵、三种隔离动作、边界说明 |
