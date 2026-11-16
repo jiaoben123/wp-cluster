@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 
 WP_CLUSTER_MAIN=1
-WP_CLUSTER_VERSION="2.3.0"
+WP_CLUSTER_VERSION="2.3.1"
 
 # ---------- 退出码（供监控/脚本判断）----------
 readonly E_OK=0
@@ -37,6 +37,8 @@ CORE_DIR="/var/www/wp-core"
 DB_DIR="/var/www/db"
 STATE_DIR="/etc/wp-cluster"
 BACKUP_DIR="/var/backups/wp-cluster"
+# SQLite 驱动保险副本：插件目录被删掉时 db.php 靠它继续连库（见 harden_db_dropin）
+SQLITE_FALLBACK_DIR="/var/www/sqlite-db"
 LOG_DIR="/var/log/wp-cluster"
 LOCK_FILE="/var/lock/wp-cluster.lock"
 LOCK_TIMEOUT=1800
@@ -794,6 +796,22 @@ cmd_doctor() {
 
   if detect_template; then chk_ok "模板站" "$TEMPLATE_SITE"; else chk_fail "模板站" "找不到含 SQLite 插件的站点，请设置 TEMPLATE_SITE"; fi
 
+  # SQLite 驱动冗余：插件在后台被误删时靠这两项续命，缺一项就会整站断库
+  if [ "$fix" = true ] && [ -n "${TEMPLATE_SITE:-}" ]; then
+    ensure_sqlite_fallback "$TEMPLATE_SITE" >/dev/null 2>&1 || true
+    harden_db_dropin "$TEMPLATE_SITE" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$SQLITE_FALLBACK_DIR/wp-includes/sqlite/db.php" ]; then
+    chk_ok "SQLite 保险副本" "$SQLITE_FALLBACK_DIR"
+  else
+    chk_warn "SQLite 保险副本" "缺失，删掉 SQLite 插件会整站断库（wp-cluster doctor --fix）"
+  fi
+  if [ -f "$TEMPLATE_SITE/wp-content/db.php" ] && grep -q "$SQLITE_FALLBACK_BEGIN" "$TEMPLATE_SITE/wp-content/db.php" 2>/dev/null; then
+    chk_ok "db.php 回退" "已硬化（删插件不断库）"
+  else
+    chk_warn "db.php 回退" "未硬化，删掉 SQLite 插件会整站断库（wp-cluster doctor --fix）"
+  fi
+
   if [ -f "$LSWS_CONF" ] && ols_validate; then chk_ok "OLS 配置语法"; else chk_fail "OLS 配置语法" "lshttpd -t 报错"; fi
 
   local avail_kb
@@ -1119,6 +1137,159 @@ add_action( "send_headers", function () {
 }, 1 );
 '
 
+# 关键插件保护：在后台误删「数据库驱动 / 对象缓存 / 付费插件」会让整站不可用，
+# 而 WordPress 的删除确认框拦不住手滑。这里在「界面 + 请求 + AJAX」三层拦。
+# 注意：核心 plugins.php 校验的是复数 delete_plugins，单数 delete_plugin 在
+# map_meta_cap 里没有分支，所以靠 map_meta_cap 拦不住，必须拦请求。
+PROTECT_PLUGIN_CONTENT='<?php
+/**
+ * Plugin Name: wp-cluster critical plugin guard
+ * Description: 阻止在后台误删会导致整站不可用的插件（SQLite 数据库驱动 / 对象缓存 / 付费插件）。
+ * Version: 1.0.0
+ */
+if ( ! defined( "ABSPATH" ) ) { return; }
+
+function wpc_locked_plugins() {
+    return array(
+        "sqlite-database-integration" => "SQLite 数据库驱动。删掉它整站会立刻报 Error establishing a database connection。",
+        "apcu-manager"                => "APCu 对象缓存。删掉会丢对象缓存，后台与动态页明显变慢。",
+        "advanced-custom-fields-pro"  => "ACF Pro 自定义字段（付费）。删掉后所有自定义字段内容都不再显示，且无法从官方直接重下。",
+        "seo-by-rank-math-pro"        => "Rank Math Pro（付费）。删掉后无法从官方直接重下。",
+        "litespeed-cache"             => "LiteSpeed Cache 整页缓存。删掉后 TTFB 会从 10ms 回到 400ms 以上。"
+    );
+}
+
+function wpc_locked_reason( $plugin ) {
+    $locked = wpc_locked_plugins();
+    $dir    = strtok( (string) $plugin, "/" );
+    return isset( $locked[ $dir ] ) ? $locked[ $dir ] : "";
+}
+
+function wpc_locked_block( $plugins ) {
+    foreach ( (array) $plugins as $p ) {
+        if ( wpc_locked_reason( $p ) ) { return $p; }
+    }
+    return "";
+}
+
+function wpc_locked_die( $plugin ) {
+    wp_die(
+        "<h1>这个插件受保护，不能删除</h1>"
+        . "<p>插件：<code>" . esc_html( $plugin ) . "</code></p>"
+        . "<p>" . esc_html( wpc_locked_reason( $plugin ) ) . "</p>"
+        . "<p>确实需要删除，请先在服务器上把 <code>wp-content/mu-plugins/zz-wpc-protect-critical.php</code> 改名停用保护，再回来操作。</p>",
+        "插件受保护",
+        array( "response" => 403, "back_link" => true )
+    );
+}
+
+// 1) 界面层：去掉「删除」链接，并加一个受保护标记
+add_filter( "plugin_action_links", function ( $actions, $plugin_file = "" ) {
+    if ( ! wpc_locked_reason( $plugin_file ) ) { return $actions; }
+    unset( $actions["delete"] );
+    $actions["wpc_locked"] = "<span style=\"color:#b32d2e\" title=\"由 wp-cluster 保护：删除会导致整站不可用\">受保护</span>";
+    return $actions;
+}, 10, 2 );
+
+// 2) 请求层：plugins.php 的删除动作在真正删文件之前拦下
+add_action( "load-plugins.php", function () {
+    $action = isset( $_REQUEST["action"] ) ? (string) $_REQUEST["action"] : "";
+    if ( ! in_array( $action, array( "delete-selected", "delete", "delete-plugin" ), true ) ) { return; }
+    $checked = isset( $_REQUEST["checked"] ) ? (array) $_REQUEST["checked"] : array();
+    if ( isset( $_REQUEST["plugin"] ) ) { $checked[] = (string) $_REQUEST["plugin"]; }
+    $hit = wpc_locked_block( $checked );
+    if ( $hit ) { wpc_locked_die( $hit ); }
+} );
+
+// 3) AJAX 层：优先级 1，先于核心的 wp_ajax_delete-plugin 执行
+add_action( "wp_ajax_delete-plugin", function () {
+    $plugin = isset( $_REQUEST["plugin"] ) ? (string) $_REQUEST["plugin"] : "";
+    if ( wpc_locked_reason( $plugin ) ) { wpc_locked_die( $plugin ); }
+}, 1 );
+'
+
+# 硬化 db.php 用的回退块（与 SQLITE_FALLBACK_DIR 配套）
+SQLITE_FALLBACK_BEGIN='wpc_sqlite_candidates'
+
+# 建 SQLite 驱动保险副本（硬链接，不额外占空间）。插件被删掉时 db.php 走这条路径。
+ensure_sqlite_fallback() {
+  local site_dir="${1:-}"
+  [ -d "$SQLITE_FALLBACK_DIR" ] && return 0
+  [ -n "$site_dir" ] || return 0
+  local src="$site_dir/wp-content/plugins/sqlite-database-integration"
+  [ -d "$src" ] || return 0
+  if $DRY_RUN; then
+    step "[dry-run] 建立 SQLite 保险副本 $SQLITE_FALLBACK_DIR"
+    return 0
+  fi
+  run mkdir -p "$(dirname "$SQLITE_FALLBACK_DIR")"
+  run cp -al "$src" "$SQLITE_FALLBACK_DIR" 2>/dev/null || run cp -a "$src" "$SQLITE_FALLBACK_DIR" 2>/dev/null || true
+  chown -R "$WEB_USER:$WEB_GROUP" "$SQLITE_FALLBACK_DIR" 2>/dev/null || true
+  step "SQLite 保险副本 $SQLITE_FALLBACK_DIR"
+}
+
+# 给 wp-content/db.php 打「多路径回退」补丁（幂等）。
+# 原版 drop-in 只认 wp-content/plugins/sqlite-database-integration；该插件一旦在后台
+# 被删，db.php 会静默 return，WordPress 退回 mysqli 去连 DB_HOST=mysql，整站报
+# "Error establishing a database connection"。补上保险路径后删插件也不会断库。
+harden_db_dropin() {
+  local site_dir="${1:-}"
+  local db="$site_dir/wp-content/db.php"
+  [ -f "$db" ] || return 0
+  grep -q "$SQLITE_FALLBACK_BEGIN" "$db" 2>/dev/null && return 0
+  if $DRY_RUN; then
+    step "[dry-run] 硬化 db.php（SQLite 多路径回退）"
+    return 0
+  fi
+  local blk; blk=$(mktemp)
+  cat >"$blk" <<'BLK'
+// wp-cluster: SQLite 实现目录多路径回退。
+// 原版只认 wp-content/plugins/sqlite-database-integration；在后台把这个插件删掉后，
+// 这里会静默 return，WordPress 退回 mysqli 去连 DB_HOST=mysql，整站报
+// "Error establishing a database connection"。加了保险副本后，删插件也不会断库。
+$sqlite_plugin_implementation_folder_path = '{SQLITE_IMPLEMENTATION_FOLDER_PATH}';
+$wpc_sqlite_candidates = array(
+	$sqlite_plugin_implementation_folder_path,
+	__DIR__ . '/plugins/sqlite-database-integration',
+	__DIR__ . '/sqlite-db',
+	'/var/www/sqlite-db',
+	__DIR__ . '/mu-plugins/sqlite-database-integration',
+);
+$sqlite_plugin_implementation_folder_path = '';
+foreach ( $wpc_sqlite_candidates as $wpc_sqlite_candidate ) {
+	if ( $wpc_sqlite_candidate && file_exists( $wpc_sqlite_candidate . '/wp-includes/sqlite/db.php' ) ) {
+		$sqlite_plugin_implementation_folder_path = $wpc_sqlite_candidate;
+		break;
+	}
+}
+unset( $wpc_sqlite_candidates, $wpc_sqlite_candidate );
+
+if ( ! $sqlite_plugin_implementation_folder_path ) {
+	error_log( '[wp-cluster] 找不到 SQLite 实现目录（plugins/sqlite-database-integration、wp-content/sqlite-db、/var/www/sqlite-db 均缺失），数据库无法连接。请从备份恢复该插件。' );
+	return;
+}
+
+BLK
+  cp -a "$db" "$db.wpc-bak" 2>/dev/null || true
+  if "$PHP_BIN" -d error_reporting=0 -r '
+$f = $argv[1]; $b = $argv[2];
+$s = @file_get_contents( $f );
+if ( false === $s ) { exit( 1 ); }
+if ( false !== strpos( $s, "wpc_sqlite_candidates" ) ) { exit( 0 ); }
+$start = strpos( $s, "// Tweak to allow copy-pasting" );
+$end   = strpos( $s, "\n/**\n * Legacy database type marker." );
+if ( false === $start || false === $end || $end <= $start ) { exit( 2 ); }
+$block = @file_get_contents( $b );
+if ( false === $block || "" === $block ) { exit( 3 ); }
+file_put_contents( $f, substr( $s, 0, $start ) . $block . substr( $s, $end ) );
+' -- "$db" "$blk"; then
+    chown "$WEB_USER:$WEB_GROUP" "$db" 2>/dev/null || true
+  else
+    warn "db.php 硬化失败（drop-in 结构可能已变），站点可用但删掉 SQLite 插件会断库"
+  fi
+  rm -f "$blk"
+}
+
 cmd_init() {
   need_root init
   step "初始化 wp-cluster 环境"
@@ -1138,8 +1309,13 @@ cmd_init() {
   fi
 
   printf '%s' "$MU_PLUGIN_CONTENT" | write_file "$STATE_DIR/mu-plugins/wp-cluster-noindex.php"
+  printf '%s' "$PROTECT_PLUGIN_CONTENT" | write_file "$STATE_DIR/mu-plugins/zz-wpc-protect-critical.php"
 
   build_core
+
+  # 顺手把模板站也硬化：新站是 cp -a 模板站来的，模板站硬化了新站才自带
+  ensure_sqlite_fallback "$TEMPLATE_SITE"
+  harden_db_dropin "$TEMPLATE_SITE"
 
   # 日志轮转
   write_file /etc/logrotate.d/wp-cluster <<'LR'
@@ -1387,7 +1563,11 @@ cmd_add() {
         cp -a "$TEMPLATE_SITE/wp-content/mu-plugins/." "$site_dir/wp-content/mu-plugins/" 2>/dev/null || true
     fi
     cp -f "$STATE_DIR/mu-plugins/wp-cluster-noindex.php" "$site_dir/wp-content/mu-plugins/" 2>/dev/null || true
+    cp -f "$STATE_DIR/mu-plugins/zz-wpc-protect-critical.php" "$site_dir/wp-content/mu-plugins/" 2>/dev/null || true
     strip_mu_plugins "$site_dir/wp-content"
+    # 底层加固：SQLite 驱动留一份插件后台删不到的保险副本，并让 db.php 会去找它
+    ensure_sqlite_fallback "$site_dir"
+    harden_db_dropin "$site_dir"
   fi
 
   # 3) wp-config

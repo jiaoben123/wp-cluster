@@ -2,6 +2,58 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.1] - 2026-11-16
+
+防「后台误删插件把整站搞挂」。起因：在 wp-admin 里删掉 `sqlite-database-integration`
+之后，整站变成 `Error establishing a database connection`，且这个报错完全指不到真正原因。
+
+### 根因
+`wp-content/db.php`（SQLite drop-in）只认一条路径：
+
+```php
+$path = realpath( __DIR__ . '/plugins/sqlite-database-integration' );
+if ( ! $path || ! file_exists( $path . '/wp-includes/sqlite/db.php' ) ) { return; }
+```
+
+插件目录被删 → 这里**静默 return** → WordPress 认为没有 drop-in，退回 mysqli 去连
+`DB_HOST=mysql` → 报数据库连接失败。所以用户看到的是「数据库连不上」，实际是
+「数据库驱动插件被删了」。
+
+### 新增
+- **`harden_db_dropin <站点目录>`**：给 `db.php` 打多路径回退补丁（幂等）。查找顺序：
+  1. `{SQLITE_IMPLEMENTATION_FOLDER_PATH}`（原占位符，保持兼容）
+  2. `wp-content/plugins/sqlite-database-integration`（原路径）
+  3. `wp-content/sqlite-db`（站点内保险副本）
+  4. `/var/www/sqlite-db`（集群级保险副本，`SQLITE_FALLBACK_DIR`）
+  5. `wp-content/mu-plugins/sqlite-database-integration`
+
+  全部缺失时写一条指向明确的 `error_log`，而不是让用户面对「数据库连接失败」猜。
+  打补丁前自动备份为 `db.php.wpc-bak`；drop-in 结构变化导致定位失败时只告警不阻断。
+- **`ensure_sqlite_fallback <站点目录>`**：用 `cp -al` 建 `/var/www/sqlite-db`
+  保险副本（硬链接，不额外占空间）。
+- **`zz-wpc-protect-critical.php`**（mu-plugin）：拦住会搞挂整站的关键插件被删除。
+  保护 `sqlite-database-integration`、`apcu-manager`、`advanced-custom-fields-pro`、
+  `seo-by-rank-math-pro`、`litespeed-cache`。
+  - 界面层：`plugin_action_links` 去掉「删除」链接，显示「受保护」；
+  - 请求层：`load-plugins.php` 在删文件之前 `wp_die(403)`，批量删除里混入受保护插件会整批拦下；
+  - AJAX 层：`wp_ajax_delete-plugin` 优先级 1 先拦。
+
+  注：核心 `plugins.php` 校验的是**复数** `delete_plugins`，而单数 `delete_plugin` 在
+  `map_meta_cap` 里没有分支（永远返回 false），所以靠 `map_meta_cap` 拦不住，必须拦请求。
+- **`doctor` 新增两项检查**：「SQLite 保险副本」「db.php 回退」，`doctor --fix` 可一键补齐。
+- `init` 与 `add` 都会自动执行上述加固：模板站被硬化，新站 `cp -a` 过来即自带。
+
+### 修复
+- **回归套件写死端口**：`[J 隔离] 其他站未受影响` 固定请求 `127.0.0.1:8081`，
+  该端口没有站点时误报失败。改为从注册表里挑第一个非本次测试的端口模式站点，
+  一个都没有则如实 `SKIP`。
+
+### 实测
+- 删掉受保护插件：界面无「删除」链接，手工构造请求返回 403 并提示原因，目录仍在。
+- 删掉普通插件：确认页 200 → `verify-delete=1` 302 → 目录消失（未误伤）。
+- 把 `plugins/sqlite-database-integration` 整个移走：站点仍 200、后台仍可登录（走保险副本）。
+- `add` 新站自动带保护 mu-plugin 与硬化 `db.php`；回归 110 通过 / 0 失败 / 2 跳过。
+
 ## [2.3.0] - 2026-11-16
 
 运行时调优，一档「性能优先」。全部结论来自 1 核 / 1469MB / 6 站本机实测

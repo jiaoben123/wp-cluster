@@ -299,7 +299,21 @@ t_ok "isolate --core 拆硬链接" wp-cluster isolate "$D1" --core
 LINKS_AFTER=$(find "/var/www/$D1" -type f -links +1 2>/dev/null | wc -l)
 if [ "$LINKS_AFTER" -lt "$LINKS_BEFORE" ] || [ "$LINKS_AFTER" -eq 0 ]; then ok "硬链接已拆分（$LINKS_BEFORE → $LINKS_AFTER）"; else bad "硬链接已拆分" "$LINKS_BEFORE → $LINKS_AFTER"; fi
 t_http "拆链后站点正常" "http://127.0.0.1:$P1/?core=$RANDOM"
-t_http "其他站未受影响" "http://127.0.0.1:8081/"
+# 「其他站」不能写死端口：生产环境里 8081 上未必有站点，写死会误报失败。
+# 从注册表里挑第一个「非本次测试站」的端口模式站点；一个都没有就如实跳过。
+OTHER_URL=""
+for f in /etc/wp-cluster/sites/*.env; do
+  [ -f "$f" ] || continue
+  _d=$(basename "$f" .env); [ "$_d" = "$D1" ] && continue
+  _m=$(grep -m1 '^MODE=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"')
+  _p=$(grep -m1 '^PORT=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"')
+  if [ "$_m" = "port" ] && [ -n "$_p" ]; then OTHER_URL="http://127.0.0.1:$_p/"; break; fi
+done
+if [ -n "$OTHER_URL" ]; then
+  t_http "其他站未受影响" "$OTHER_URL"
+else
+  skip "其他站未受影响" "本机无第二个端口模式站点"
+fi
 t_ok "拆链后 verify 仍通过" wp-cluster verify
 t_ok "isolate 参数重复无害" bash -c "wp-cluster isolate $D1 --core >/dev/null 2>&1; wp-cluster isolate $D1 --php-pool 2 >/dev/null 2>&1"
 

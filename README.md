@@ -370,6 +370,28 @@ PHP 池隔离与撤销、guard 巡检、锁冲突、删除后残留检查。
 - vhost 默认带 HSTS / CSP / X-Frame-Options / Permissions-Policy / Referrer-Policy。
 - 删除站点、恢复覆盖、卸载清空都需要输入域名或确认词。
 
+### 后台误删插件不会搞挂整站
+
+SQLite 方案的命门在 `wp-content/db.php`：它是数据库驱动 drop-in，只认
+`wp-content/plugins/sqlite-database-integration` 这一条路径。这个插件一旦在
+wp-admin 里被删掉，`db.php` 会**静默 return**，WordPress 退回 mysqli 去连
+`DB_HOST=mysql`，整站变成 `Error establishing a database connection` ——
+报错完全指不到真正原因。
+
+两层防护（`init` / `add` 时自动生效）：
+
+1. **保险副本 + 多路径回退**：`/var/www/sqlite-db`（`cp -al` 硬链接，不额外占空间），
+   `db.php` 按 `plugins/` → `wp-content/sqlite-db` → `/var/www/sqlite-db` →
+   `mu-plugins/` 顺序找实现，全都找不到才写一条指向明确的 `error_log`。
+   实测把插件目录整个移走，站点仍 200、后台仍能登录。
+2. **关键插件保护**（`zz-wpc-protect-critical.php`）：`sqlite-database-integration`、
+   `apcu-manager`、`advanced-custom-fields-pro`、`seo-by-rank-math-pro`、
+   `litespeed-cache` 在插件列表里**没有「删除」链接**，显示「受保护」；
+   手工构造删除请求会被 403 拦下并说明原因；批量删除里混入受保护插件会整批拦下。
+
+`wp-cluster doctor` 会检查这两项，`doctor --fix` 可一键补齐。确实要删，先把
+`wp-content/mu-plugins/zz-wpc-protect-critical.php` 改名再操作。
+
 ---
 
 ## 已知限制
