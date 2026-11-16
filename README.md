@@ -415,7 +415,7 @@ $wp_filesystem->delete( WP_CONTENT_DIR . '/db.php' );
 - `load-plugins.php` 同时拦截 `activate` / `deactivate` / `activate-selected` /
   `deactivate-selected`，即使手工构造 URL 也返回 403；
 - 删除拦截（界面 / 请求 / AJAX 三层）继续保留；
-- 插件页显示一条不点名的提示，说明系统组件由部署脚本托管。
+- 后台**不再输出任何说明横幅**（2.3.4 起静默）：该藏的已经藏了，不需要每次进后台再解释一遍。
 
 实测：后台列表已看不到该插件；手工构造启用 / 停用 / 删除请求全部 403；其他受保护插件
 仍显示「受保护」；首页仍 200。

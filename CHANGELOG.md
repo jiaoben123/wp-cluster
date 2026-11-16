@@ -2,6 +2,25 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.4] - 2026-11-16
+
+后台彻底静默：去掉两条每次进后台都会出现的提示横幅。
+
+### 变更
+- **删除 wp-cluster 自己的 `admin_notices`**：不再输出
+  「wp-cluster：数据库与缓存等系统组件由部署脚本托管…」。该藏的已经藏了，
+  再解释一遍只是噪音。`zz-wpc-protect-critical.php` 升到 1.3.0。
+- **`00-wb-indexing-gate.php` 去掉「索引状态」提示**：这条提示只看请求主机名，
+  不知道 wp-cluster 的 `WP_CLUSTER_NOINDEX` 开关，会在站点实际 noindex 时
+  仍然显示「索引状态：开放」，属于误导。门禁逻辑（本地/内网 noindex、
+  正式域名放开）完全保留，只删提示。原文件备份为
+  `/root/backups/00-wb-indexing-gate.php.bak-*`。
+
+### 实测
+- 插件页：「系统组件由部署脚本托管」0 次、「索引状态」0 次；
+- SQLite 行仍 0 次、PerfOps One 菜单仍 0 次；
+- 首页 200，后台 200。
+
 ## [2.3.3] - 2026-11-16
 
 后台清理：隐藏用不到的菜单与编辑页卡片，并修掉「SQLite 驱动仍出现在插件列表」的缓存问题。
