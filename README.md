@@ -420,6 +420,20 @@ $wp_filesystem->delete( WP_CONTENT_DIR . '/db.php' );
 实测：后台列表已看不到该插件；手工构造启用 / 停用 / 删除请求全部 403；其他受保护插件
 仍显示「受保护」；首页仍 200。
 
+> 如果浏览器里还能看到这一行，是页面缓存：强制刷新（Ctrl+F5）即可。2.3.3 起插件页
+> 额外注入 CSS 双保险，即使缓存了旧 HTML 也会把那一行藏掉。
+
+### 后台界面清理（2.3.3）
+
+同一份 mu-plugin 还做了展示层清理，**只隐藏界面，不影响任何功能**：
+
+- **PerfOps One / APCu Manager 菜单**：侧栏与顶部工具栏入口都隐藏。PerfOps One 只是
+  APCu 对象缓存的 UI 外壳，真正的缓存在 `object-cache.php` drop-in 里。需要排查时
+  仍可直接访问 `admin.php?page=perfopsone-dashboard` 等直链。
+- **文章 / 页面 / CPT 编辑页卡片**：移除「内容 AI」（Rank Math 付费推广）、「链接建议」
+  （空卡片）、「LiteSpeed」缓存控制、「作者」「摘要」「Transposh 语言」等 6 个用不到的
+  卡片；Rank Math SEO 主卡片和 ACF 自定义字段保留。
+
 ---
 
 ## 已知限制

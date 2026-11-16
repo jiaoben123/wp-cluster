@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 
 WP_CLUSTER_MAIN=1
-WP_CLUSTER_VERSION="2.3.2"
+WP_CLUSTER_VERSION="2.3.3"
 
 # ---------- 退出码（供监控/脚本判断）----------
 readonly E_OK=0
@@ -1145,7 +1145,7 @@ PROTECT_PLUGIN_CONTENT='<?php
 /**
  * Plugin Name: wp-cluster critical plugin guard
  * Description: 系统组件保护：隐藏 SQLite 数据库驱动，阻止误删 / 误激活会导致整站不可用的插件。
- * Version: 1.1.0
+ * Version: 1.2.0
  */
 if ( ! defined( "ABSPATH" ) ) { return; }
 
@@ -1251,6 +1251,51 @@ add_action( "admin_notices", function () {
     $screen = function_exists( "get_current_screen" ) ? get_current_screen() : null;
     if ( ! $screen || "plugins" !== $screen->id ) { return; }
     echo "<div class=\"notice notice-info\"><p><strong>wp-cluster：</strong>数据库与缓存等系统组件由部署脚本托管，不在此列表显示，也无法在后台启用或停用。如需调整，请在服务器上操作 <code>wp-content/db.php</code> 与 <code>wp-content/mu-plugins/</code>。</p></div>";
+} );
+
+// 5) 隐藏 PerfOps One / APCu Manager 的设置菜单（PerfOpsOne 是 APCu 的 UI 外壳，
+//    真正的对象缓存在 wp-content/object-cache.php drop-in，隐藏菜单不影响功能）。
+//    只隐藏菜单，不取消注册页面——已收藏的直链仍可用，方便排查问题。
+add_action( "admin_menu", function () {
+    remove_menu_page( "perfopsone-dashboard" );
+    remove_submenu_page( "perfopsone-dashboard", "perfopsone-tools" );
+    remove_submenu_page( "perfopsone-dashboard", "perfopsone-analytics" );
+    remove_submenu_page( "perfopsone-dashboard", "apcm-settings" );
+    remove_submenu_page( "perfopsone-dashboard", "apcm-viewer" );
+}, 999 );
+
+// 6) 顶部工具栏里的 PerfOps One 节点（CSS 兜底，防止对方用更高优先级重新添加）
+add_action( "admin_head", function () {
+    echo "<style>#wp-admin-bar-perfopsone-dashboard,#wp-admin-bar-perfopsone-tools,#wp-admin-bar-perfopsone-analytics{display:none!important}</style>";
+}, 999 );
+add_action( "admin_bar_menu", function ( $bar ) {
+    $bar->remove_node( "perfopsone-dashboard" );
+    $bar->remove_node( "perfopsone-tools" );
+    $bar->remove_node( "perfopsone-analytics" );
+}, 999 );
+
+// 7) 文章 / 页面 / CPT 编辑页：隐藏用不到的推广卡片与设置卡片
+add_action( "add_meta_boxes", function () {
+    $kill = array(
+        "rank_math_metabox_content_ai",       // 「内容 AI」付费订阅推广
+        "rank_math_metabox_link_suggestions",  // 「链接建议」空卡片
+        "litespeed_meta_boxes",                // LiteSpeed 缓存手动控制
+        "authordiv",                           // 作者（单作者站用不到）
+        "postexcerpt",                         // 摘要（Rank Math 用 seo_description）
+        "transposh_setlanguage"                // Transposh 逐篇语言设置
+    );
+    $screen = function_exists( "get_current_screen" ) ? get_current_screen() : null;
+    $sid = $screen ? $screen->id : "post";
+    foreach ( $kill as $id ) {
+        remove_meta_box( $id, $sid, "advanced" );
+        remove_meta_box( $id, $sid, "normal" );
+        remove_meta_box( $id, $sid, "side" );
+    }
+}, 999 );
+
+// 8) 插件页 CSS 双保险：即使有页面缓存，也把系统组件那一行藏掉
+add_action( "admin_head-plugins.php", function () {
+    echo "<style>tr[data-slug=\"sqlite-database-integration\"]{display:none!important}</style>";
 } );
 '
 

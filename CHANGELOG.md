@@ -2,6 +2,28 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.3] - 2026-11-16
+
+后台清理：隐藏用不到的菜单与编辑页卡片，并修掉「SQLite 驱动仍出现在插件列表」的缓存问题。
+
+### 变更
+- **`zz-wpc-protect-critical.php` 升到 1.2.0**：
+  - 插件页注入 CSS 双保险 `tr[data-slug="sqlite-database-integration"]{display:none}`，
+    即使浏览器缓存了旧 HTML，那一行也不会显示（解决用户截图里仍看到的问题）；
+  - 隐藏 PerfOps One 侧栏菜单与顶部工具栏节点（CSS 兜底，防对方高优先级重新添加）；
+    只隐藏入口、不取消注册页面，直链仍可用于排查；
+  - 文章 / 页面 / CPT 编辑页移除 6 个用不到的卡片：`rank_math_metabox_content_ai`
+    （付费订阅推广）、`rank_math_metabox_link_suggestions`（空链接建议）、
+    `litespeed_meta_boxes`、`authordiv`、`postexcerpt`、`transposh_setlanguage`。
+    保留 Rank Math SEO 主卡片与 ACF 字段。
+- `doctor` 不受影响；隐藏只作用在后台展示层，缓存/数据库功能照常。
+
+### 实测（ww2.vitden.com 后台真实 HTTP）
+- 插件页 `<tr data-slug="sqlite-database-integration">` 出现 0 次，CSS 规则存在；
+- PerfOps One 侧栏菜单 0 次，工具栏节点被 CSS 隐藏；
+- 编辑页 6 个目标卡片 ID 全部 0 次，Rank Math 主卡片 1 次、ACF 字段 10 次；
+- 删除/启用/停用三类请求仍全部 403；首页与后台均 200。
+
 ## [2.3.2] - 2026-11-16
 
 把 SQLite 驱动从「删不掉」升级为「看不见、激活不了」。起因：用户问
