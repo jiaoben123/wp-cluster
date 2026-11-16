@@ -587,7 +587,9 @@ if [ "$MODE" = "check" ]; then
   # self-update 之后它不会跟着变，读它会显示旧版本、让人误以为更新失败。
   wpc_inst=""
   if command -v wp-cluster >/dev/null 2>&1; then
-    wpc_inst=$(wp-cluster version 2>/dev/null | head -1 | awk '{print $2}')
+    # 用 awk 读完整个输出：接 head 会提前关管道，wp-cluster 收 SIGPIPE，
+    # 在 set -o pipefail 下整条管道返回 141，直接把安装器打断。
+    wpc_inst=$(wp-cluster version 2>/dev/null | awk 'NR==1{print $2}')
   fi
   if [ -z "${wpc_inst:-}" ] && [ -f "$INSTALL_DIR/VERSION" ]; then
     wpc_inst=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null)
