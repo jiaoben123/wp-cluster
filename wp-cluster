@@ -2129,12 +2129,24 @@ resolve_update_url() {
   printf '%s' "$UPDATE_URL_DEFAULT"
 }
 
+# 地址来自哪里（排错用：配置里残留的旧地址会盖掉标记文件）
+resolve_update_source() {
+  if [ -n "${WP_CLUSTER_UPDATE_URL:-}" ]; then printf '%s' "环境变量 WP_CLUSTER_UPDATE_URL"; return 0; fi
+  if [ -n "${SELF_UPDATE_URL:-}" ]; then printf '%s' "配置文件 SELF_UPDATE_URL"; return 0; fi
+  local f
+  for f in "${UPDATE_URL_MARKERS[@]}"; do
+    [ -n "$f" ] && [ -r "$f" ] && [ -s "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  printf '%s' "内置默认"
+}
+
 cmd_self_update() {
   need_root self-update
   local target tmp
   target=$(readlink -f "$0")
   tmp=$(mktemp)
   step "从上游获取最新版本：$(resolve_update_url)"
+  printf '  来源：%s\n' "$(resolve_update_source)"
   if ! curl -fsSL --max-time 30 "$(resolve_update_url)" -o "$tmp"; then
     rm -f "$tmp"; die_code "$E_EXTERNAL" "下载失败"
   fi

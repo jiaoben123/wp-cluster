@@ -24,6 +24,15 @@
   标记文件 → 内置默认，换仓库/换分支无需改代码。
 - 仓库文件：`LICENSE`（MIT）、`.gitignore`、README 增加「一行安装 / 环境要求 / 许可证」。
 
+### 修复（首次公开前的自查）
+- **安装器 root 下误报「安装中断」**：`wp --version` 以 root 运行会拒绝执行（需要 `--allow-root`），
+  命令替换失败触发 ERR trap，打印「已安装：」后跟空版本号。抽出 `wp_cli_version()` 助手，
+  带 `--allow-root` 且在子 shell 内关掉 `errexit/pipefail`，失败不再打断流程；`--check` 段同步改用。
+- **`fetch_repo` 漏拷安装器**：`/root/wp-cluster` 里缺 `install-wp-cluster.sh`，目录不完整。
+- **`self-update` 增加地址来源提示**：输出「来源：环境变量 / 配置文件 / 标记文件路径 / 内置默认」。
+  配置文件里残留的旧 `SELF_UPDATE_URL` 优先级高于标记文件，会静默盖掉新地址；安装器在写入标记后
+  会检测并告警。
+
 ### 变更
 - `SELF_UPDATE_URL` 默认值改为空，交由 `resolve_update_url()` 解析；默认指向
   `jiaoben123/wp-cluster@main`。

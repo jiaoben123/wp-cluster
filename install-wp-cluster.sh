@@ -306,14 +306,24 @@ fetch_repo() {
 
 write_update_marker() {
   step "记录自更新地址"
+  local url="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REPO_BRANCH/wp-cluster"
   mkdir -p "$(dirname "$UPDATE_URL_FILE")"
-  printf '%s\n' "https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/$REPO_BRANCH/wp-cluster" \
-    >"$UPDATE_URL_FILE"
+  printf '%s\n' "$url" >"$UPDATE_URL_FILE"
   chmod 600 "$UPDATE_URL_FILE"
   mkdir -p /etc/wp-cluster
   cp -f "$UPDATE_URL_FILE" /etc/wp-cluster/update-url
   chmod 600 /etc/wp-cluster/update-url
   ok "已写入 $UPDATE_URL_FILE（wp-cluster self-update 会读它）"
+
+  # 配置文件里的 SELF_UPDATE_URL 优先级高于上面的标记文件：若是旧地址残留，会静默盖掉新地址
+  local conf="/etc/wp-cluster/wp-cluster.conf" pinned=''
+  if [ -f "$conf" ]; then
+    pinned=$(sed -n 's/^SELF_UPDATE_URL="\(.*\)"/\1/p' "$conf" | head -1)
+    if [ -n "$pinned" ] && [ "$pinned" != "$url" ]; then
+      printf '  ! %s 里的 SELF_UPDATE_URL 指向 %s\n' "$conf" "$pinned" >&2
+      printf '    它优先级更高，会让 self-update 从旧地址拉取；如需改用本次地址，请把该项改为空字符串。\n' >&2
+    fi
+  fi
 }
 
 # =============================================================================
