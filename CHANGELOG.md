@@ -2,6 +2,39 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.2] - 2026-11-16
+
+把 SQLite 驱动从「删不掉」升级为「看不见、激活不了」。起因：用户问
+「SQLite Database Integration 可以点启用吗？怎么隐藏？给客户安装一不小心就没了」。
+
+### 为什么不能点启用
+读插件源码确认：
+
+- `activate.php` 的 `sqlite_activation()` 只有在 `?page=sqlite-integration&confirm-install`
+  时才调用 `sqlite_plugin_copy_db_file()`，普通「启用」按钮不做正确初始化；
+- `deactivate.php` 的 `sqlite_plugin_remove_db_file()` 会执行
+  `$wp_filesystem->delete( WP_CONTENT_DIR . '/db.php' )`。
+
+而 `db.php` 是 drop-in，直接 require 驱动实现，绕过 `active_plugins`，所以当前
+「Inactive」是刻意保持的正确状态。启用后再停用反而会删掉真正的数据库驱动。
+
+### 新增
+- **`wpc_system_plugins()`**：把 `sqlite-database-integration` 标记为系统组件。
+- **`all_plugins` 过滤（优先级 999）**：系统组件从后台插件列表隐藏。
+- **`load-plugins.php` 扩展拦截**：除原有删除动作外，新增拦
+  `activate` / `deactivate` / `activate-selected` / `deactivate-selected`；
+  手工构造 URL 也返回 403。
+- **`admin_notices`**：插件页显示一条不点名的提示，说明系统组件由部署脚本托管。
+- `PROTECT_PLUGIN_CONTENT` 升到 1.1.0；`wpc_locked_die()` 支持动作名，403 提示会写明
+  是不能「删除 / 启用 / 停用 / activate / deactivate」。
+
+### 实测（ww2.vitden.com 后台真实 HTTP）
+- 登录 302、cookie 正常；
+- 插件页已无 `sqlite-database-integration` 字样，提示文案已显示；
+- 其他 4 个受保护插件仍可见，行内「受保护」标记 4 处；
+- 手工构造 activate / deactivate / delete 请求：全部 HTTP 403，提示命中；
+- SQLite 驱动目录仍在，首页仍 200。
+
 ## [2.3.1] - 2026-11-16
 
 防「后台误删插件把整站搞挂」。起因：在 wp-admin 里删掉 `sqlite-database-integration`

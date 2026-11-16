@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 
 WP_CLUSTER_MAIN=1
-WP_CLUSTER_VERSION="2.3.1"
+WP_CLUSTER_VERSION="2.3.2"
 
 # ---------- 退出码（供监控/脚本判断）----------
 readonly E_OK=0
@@ -1144,14 +1144,14 @@ add_action( "send_headers", function () {
 PROTECT_PLUGIN_CONTENT='<?php
 /**
  * Plugin Name: wp-cluster critical plugin guard
- * Description: 阻止在后台误删会导致整站不可用的插件（SQLite 数据库驱动 / 对象缓存 / 付费插件）。
- * Version: 1.0.0
+ * Description: 系统组件保护：隐藏 SQLite 数据库驱动，阻止误删 / 误激活会导致整站不可用的插件。
+ * Version: 1.1.0
  */
 if ( ! defined( "ABSPATH" ) ) { return; }
 
 function wpc_locked_plugins() {
     return array(
-        "sqlite-database-integration" => "SQLite 数据库驱动。删掉它整站会立刻报 Error establishing a database connection。",
+        "sqlite-database-integration" => "SQLite 数据库驱动。它不在「已启用插件」里，但 wp-content/db.php 直接调用它；删掉或停用都会让整站立刻报 Error establishing a database connection。",
         "apcu-manager"                => "APCu 对象缓存。删掉会丢对象缓存，后台与动态页明显变慢。",
         "advanced-custom-fields-pro"  => "ACF Pro 自定义字段（付费）。删掉后所有自定义字段内容都不再显示，且无法从官方直接重下。",
         "seo-by-rank-math-pro"        => "Rank Math Pro（付费）。删掉后无法从官方直接重下。",
@@ -1159,10 +1159,29 @@ function wpc_locked_plugins() {
     );
 }
 
+// 系统组件：通过 drop-in 工作，不依赖 active_plugins。
+// 关键：SQLite 插件的停用回调会 $wp_filesystem->delete( WP_CONTENT_DIR . "/db.php" )，
+// 所以绝不能让它被「启用」——一旦以后停用，就会删掉真正的数据库驱动。
+function wpc_system_plugins() {
+    return array(
+        "sqlite-database-integration" => "SQLite 数据库驱动（系统组件，保持未启用是正确状态）"
+    );
+}
+
+function wpc_plugin_dir( $plugin ) {
+    return strtok( (string) $plugin, "/" );
+}
+
 function wpc_locked_reason( $plugin ) {
     $locked = wpc_locked_plugins();
-    $dir    = strtok( (string) $plugin, "/" );
+    $dir    = wpc_plugin_dir( $plugin );
     return isset( $locked[ $dir ] ) ? $locked[ $dir ] : "";
+}
+
+function wpc_system_reason( $plugin ) {
+    $system = wpc_system_plugins();
+    $dir    = wpc_plugin_dir( $plugin );
+    return isset( $system[ $dir ] ) ? $system[ $dir ] : "";
 }
 
 function wpc_locked_block( $plugins ) {
@@ -1172,18 +1191,27 @@ function wpc_locked_block( $plugins ) {
     return "";
 }
 
-function wpc_locked_die( $plugin ) {
+function wpc_locked_die( $plugin, $action = "删除" ) {
     wp_die(
-        "<h1>这个插件受保护，不能删除</h1>"
+        "<h1>这个组件受保护，不能" . esc_html( $action ) . "</h1>"
         . "<p>插件：<code>" . esc_html( $plugin ) . "</code></p>"
         . "<p>" . esc_html( wpc_locked_reason( $plugin ) ) . "</p>"
-        . "<p>确实需要删除，请先在服务器上把 <code>wp-content/mu-plugins/zz-wpc-protect-critical.php</code> 改名停用保护，再回来操作。</p>",
-        "插件受保护",
+        . "<p>确实需要操作，请先在服务器上把 <code>wp-content/mu-plugins/zz-wpc-protect-critical.php</code> 改名停用保护，再回来操作。</p>",
+        "组件受保护",
         array( "response" => 403, "back_link" => true )
     );
 }
 
-// 1) 界面层：去掉「删除」链接，并加一个受保护标记
+// 0) 系统组件隐藏：SQLite 驱动不出现在「已安装插件」列表。
+//    客户看不到，自然不会去点启用 / 删除；drop-in 仍然照常加载，不受影响。
+add_filter( "all_plugins", function ( $plugins ) {
+    foreach ( array_keys( (array) $plugins ) as $file ) {
+        if ( wpc_system_reason( $file ) ) { unset( $plugins[ $file ] ); }
+    }
+    return $plugins;
+}, 999 );
+
+// 1) 界面层：对其余受保护插件去掉「删除」链接，并加一个受保护标记
 add_filter( "plugin_action_links", function ( $actions, $plugin_file = "" ) {
     if ( ! wpc_locked_reason( $plugin_file ) ) { return $actions; }
     unset( $actions["delete"] );
@@ -1191,21 +1219,39 @@ add_filter( "plugin_action_links", function ( $actions, $plugin_file = "" ) {
     return $actions;
 }, 10, 2 );
 
-// 2) 请求层：plugins.php 的删除动作在真正删文件之前拦下
+// 2) 请求层：删除、启用、停用在真正执行前拦下。
+//    核心 plugins.php 校验的是复数 delete_plugins，单数 delete_plugin 在
+//    map_meta_cap 里没有分支，所以靠 map_meta_cap 拦不住，必须拦请求。
 add_action( "load-plugins.php", function () {
-    $action = isset( $_REQUEST["action"] ) ? (string) $_REQUEST["action"] : "";
-    if ( ! in_array( $action, array( "delete-selected", "delete", "delete-plugin" ), true ) ) { return; }
+    $action  = isset( $_REQUEST["action"] ) ? (string) $_REQUEST["action"] : "";
     $checked = isset( $_REQUEST["checked"] ) ? (array) $_REQUEST["checked"] : array();
     if ( isset( $_REQUEST["plugin"] ) ) { $checked[] = (string) $_REQUEST["plugin"]; }
-    $hit = wpc_locked_block( $checked );
-    if ( $hit ) { wpc_locked_die( $hit ); }
+
+    if ( in_array( $action, array( "delete-selected", "delete", "delete-plugin" ), true ) ) {
+        $hit = wpc_locked_block( $checked );
+        if ( $hit ) { wpc_locked_die( $hit, "删除" ); }
+    }
+
+    // 系统组件一律禁止启用/停用：停用 sqlite 会触发删除 db.php。
+    if ( in_array( $action, array( "activate", "deactivate", "activate-selected", "deactivate-selected" ), true ) ) {
+        foreach ( $checked as $p ) {
+            if ( wpc_system_reason( $p ) ) { wpc_locked_die( $p, $action ); }
+        }
+    }
 } );
 
 // 3) AJAX 层：优先级 1，先于核心的 wp_ajax_delete-plugin 执行
 add_action( "wp_ajax_delete-plugin", function () {
     $plugin = isset( $_REQUEST["plugin"] ) ? (string) $_REQUEST["plugin"] : "";
-    if ( wpc_locked_reason( $plugin ) ) { wpc_locked_die( $plugin ); }
+    if ( wpc_locked_reason( $plugin ) ) { wpc_locked_die( $plugin, "删除" ); }
 }, 1 );
+
+// 4) 插件页提示：不点名，避免暴露系统组件细节，同时解释为什么列表变短
+add_action( "admin_notices", function () {
+    $screen = function_exists( "get_current_screen" ) ? get_current_screen() : null;
+    if ( ! $screen || "plugins" !== $screen->id ) { return; }
+    echo "<div class=\"notice notice-info\"><p><strong>wp-cluster：</strong>数据库与缓存等系统组件由部署脚本托管，不在此列表显示，也无法在后台启用或停用。如需调整，请在服务器上操作 <code>wp-content/db.php</code> 与 <code>wp-content/mu-plugins/</code>。</p></div>";
+} );
 '
 
 # 硬化 db.php 用的回退块（与 SQLITE_FALLBACK_DIR 配套）

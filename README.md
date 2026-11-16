@@ -392,6 +392,34 @@ wp-admin 里被删掉，`db.php` 会**静默 return**，WordPress 退回 mysqli 
 `wp-cluster doctor` 会检查这两项，`doctor --fix` 可一键补齐。确实要删，先把
 `wp-content/mu-plugins/zz-wpc-protect-critical.php` 改名再操作。
 
+#### 为什么 SQLite 驱动显示「未启用」，而且**不要点启用**
+
+`wp-content/db.php` 是 drop-in，它直接 `require` SQLite 驱动的实现文件，**完全绕过
+`active_plugins` 开关**。所以插件列表里显示「Inactive」是正常且正确的状态：
+驱动在工作，只是不需要靠 active 标记加载。
+
+更关键的是，这个插件自己的 `deactivate.php` 里有：
+
+```php
+$wp_filesystem->delete( WP_CONTENT_DIR . '/db.php' );
+```
+
+也就是说，**启用之后再停用（或删除）会主动删掉真正的数据库驱动**，反而制造断库事故；
+而它的 `activate.php` 只有在带 `?page=sqlite-integration&confirm-install` 参数时才复制
+`db.php`，普通的「启用」按钮并不能完成正确初始化。因此绝不要为了「让它显示已启用」
+去点那个按钮。
+
+2.3.2 起把这个插件当作**系统组件**处理：
+
+- 通过 `all_plugins` 过滤从后台「已安装插件」列表**隐藏**，客户看不到，自然不会误点；
+- `load-plugins.php` 同时拦截 `activate` / `deactivate` / `activate-selected` /
+  `deactivate-selected`，即使手工构造 URL 也返回 403；
+- 删除拦截（界面 / 请求 / AJAX 三层）继续保留；
+- 插件页显示一条不点名的提示，说明系统组件由部署脚本托管。
+
+实测：后台列表已看不到该插件；手工构造启用 / 停用 / 删除请求全部 403；其他受保护插件
+仍显示「受保护」；首页仍 200。
+
 ---
 
 ## 已知限制
