@@ -108,7 +108,28 @@ wp-cluster add blog.example.com --mode domain --ssl --index --email 你的邮箱
 wp-cluster list --check
 wp-cluster health --all
 wp-cluster backup --all
+
+# 6. 运行一段时间后体检 PHP（可选，安装器已写入默认调优）
+wp-cluster tune
 ```
+
+---
+
+## 性能基线（1 核 1469MB / 6 站实测）
+
+| 路径 | 吞吐 | 延迟 |
+|---|---|---|
+| 匿名访客命中 LSCache 整页缓存 | **647–783 RPS** | p50 8.9–11.2ms（PHP 完全不参与） |
+| 动态路径（缓存 miss / 登录态 / 后台） | **24.7–26.6 RPS** | p50 37.5ms，p95 358–540ms |
+
+关键不在 PHP 参数，而在**不要叠第二套缓存**：`litespeed-cache` 之外再装 `flying-press` /
+`nginx-helper`，后者抢不到 `advanced-cache.php` 却仍每请求跑一遍，还会硬塞
+`Cache-Control: no-store`，把 LSCache 和 Cloudflare 的缓存一起废掉。拆掉后动态路径 +33%，
+再加 JIT 又是 +13%，合计 **+53%**。
+
+运行时参数一档到底（`wp-cluster tune` 可复现）：OPcache 384MB / interned 32 / JIT 128M、
+realpath 16MB、APCu 256MB、`memory_limit` 256MB。共享段按需分配，小站开大段不费内存。
+完整数据与复现方式见 [docs/TECH-STACK.md](docs/TECH-STACK.md) 第 7 节。
 
 ---
 
@@ -143,6 +164,7 @@ wp-cluster backup --all
 | `info <域> [--json]` | 详情（含后台密码，仅 root 可读） |
 | `status [--json]` | 整机资源与站群规模 |
 | `health [域\|--all] [--json]` | 健康检查，有异常返回非 0 |
+| `tune [--apply] [--yes] [--no-jit]` | PHP 运行时调优：报告 11 项参数，`--apply` 写入 php.ini + APCu ini（幂等 + 自动备份） |
 
 ### 运维
 

@@ -2,6 +2,60 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.0] - 2026-11-16
+
+运行时调优，一档「性能优先」。全部结论来自 1 核 / 1469MB / 6 站本机实测
+（详见 `docs/TECH-STACK.md` 第 7 节）。
+
+### 新增
+- **`wp-cluster tune [--apply] [--yes] [--no-jit] [--json]`**：PHP 运行时体检与调优。
+  - 只读模式打印 php.ini / APCu ini 路径、站点数、LSPHP 进程池 PSS，以及 11 项参数的
+    「当前值 → 建议值」；
+  - `--apply` 幂等写入 php.ini 与 `mods-available/40-apcu.ini`（各自自动备份，
+    重复执行不会产生重复块）；
+  - `--yes` 追加 `pkill -x lsphp` 让新配置生效（OLS 自动重拉，站点瞬断 1–2 秒）；
+  - `--no-jit` 关闭 JIT（默认开）；`--json` 供脚本消费。
+- **`install-wp-cluster.sh` 装完即调优**：`tune_php_ini()` 写入同一套性能优先档，
+  php.ini 与 APCu ini 分开处理，已存在则跳过。
+
+### 性能优先档（2–6 站 / 1 核）
+| 参数 | 默认 | 本项目 |
+|---|---|---|
+| `opcache.memory_consumption` | 128 | **384**（≤12 站统一 384，之后 512 / 768） |
+| `opcache.interned_strings_buffer` | 8 | **32** |
+| `opcache.max_accelerated_files` | 10000 | **40000** |
+| `opcache.revalidate_freq` | 2 | **60** |
+| `opcache.jit_buffer_size` | 0 | **128M** |
+| `realpath_cache_size` / `_ttl` | 4096K / 120 | **16384K / 600** |
+| `memory_limit` | 128M | **256M** |
+| `apc.shm_size` / `apc.ttl` / `entries_hint` | 128M / 7200 / 8192 | **256M / 0 / 16384** |
+
+共享段（OPcache / APCu）都是 mmap 匿名页、按需缺页分配，声明大段不等于立刻占物理内存：
+6 站灌满后 OPcache 实际只用了 64–81MB。所以按「2 站够用」配 128MB 是白亏。
+
+### 变更
+- **`doctor` 增加「OPcache 容量」检查**：低于站点数推算值时给警告并提示 `wp-cluster tune --apply`。
+
+### 实测依据
+- **拆掉第二套缓存是最大一笔**：四站同时激活 `litespeed-cache` + `flying-press` +
+  `nginx-helper`，FlyingPress 抢不到 `advanced-cache.php` 却每请求白跑一遍，还在
+  `src/Optimizer.php:22-23` 硬编码 `Cache-Control: no-store`，把 LSCache 和 Cloudflare
+  边缘缓存一起废掉。停用后动态路径 **+33%**。
+- **JIT 推翻上一版结论**：上一版写「1 核上 JIT 收益极小、保持关闭」，实测是错的。
+  开→关→开→关→开 交替五轮（每轮重启 + 预热 20 次 + 40 请求）：`work_ms` 0.46–0.52 vs
+  0.69–0.72（**−35%**，零重叠）、`load_ms` 中位 32.4 vs 37.1（**−12%**）、
+  串行 RPS 中位 26.3 vs 23.3（**+13%**）。128M 比 64M 略好，缓冲区按需分配
+  （实际只占 0.9MB），故默认 128M。
+- **OPcache 扩容 / realpath / memory_limit / APCu 扩容测不出吞吐差异**（命中率本已 99.7%、
+  wasted 0），价值在「不再逼近写满」和「后台重活不白屏」，不冒充提速。
+- 最终（同站多轮）：动态串行 16.7 → 24.7–26.6 RPS（中位 25.5，**+53%**）、
+  p50 55.3 → 37.5ms；并发 c=8 15.0 → 21.9–25.5 RPS、p95 669.9 → 358–540ms；
+  整页缓存 708 → 647–783（同量级，PHP 不参与）。
+- **PHP 子进程数保持 10**：`PHP_LSAPI_CHILDREN=6` 省 70MB PSS，但并发 p95 从 440–485ms
+  恶化到 568–654ms，1 核机器上不划算。
+- **SQLite `cache_size` 不动**：库仅 0.6–0.7MB（ww2 12.5MB），2MB 页缓存够用；page cache
+  是每连接一份，调大会按子进程数成倍放大。
+
 ## [2.2.0] - 2026-11-16
 
 首次公开发布。新增一键安装器与自更新地址标记文件，仓库化（README / LICENSE / .gitignore）。

@@ -110,7 +110,134 @@
 - `apt install lsphp83-redis` 后，**已 fork 的 LSPHP 进程不会加载新扩展**（`lswsctrl restart` 的 SIGUSR1 也不重拉子进程），表现为 `oc_fail=1` 静默降级、Redis 里却仍有 wp-cli 写的键。必须 `pkill -x lsphp` 重拉，并确认 Web 侧 `extension_loaded('redis')`。
 - C 组测完已完整恢复：`apt purge` 三个包 + autoremove、6379 未监听、临时站与探针全删、6 个生产站 HTTP 200、`doctor` 全项通过。
 
-## 7. 相关文档
+## 7. 运行时调优「最快 + 最省」本机实测（2026-11-16）
+
+三轮改动、全部在同站（site1，1 核 1469MB）用同一套压测脚本跑改前改后。**只有第 1、3 条真正提速，第 2 条是消除隐患**。
+
+### 7.1 三套缓存打架（最大一笔）
+
+四站当时同时激活 `litespeed-cache` + `flying-press` + `nginx-helper`。FlyingPress 抢不到 `advanced-cache.php`（被 LSCache 占着），却仍在每个请求里跑一遍自己的优化链，且在 `src/Optimizer.php:22-23` 硬编码：
+
+```php
+header('Cache-Control: no-store, s-maxage=0');
+header('Cloudflare-CDN-Cache-Control: no-store');
+```
+
+后果：LSCache 明明缓存了整页，响应却带 `no-store`，Cloudflare 边缘也跟着不缓存。
+
+处理：`wp plugin deactivate flying-press nginx-helper` + `wp litespeed-purge all`。四站 `no-store` 计数归零，LSCache 恢复发 `x-litespeed-cache-control: public,max-age=604800`（7 天）。
+
+### 7.2 OPcache 被写满（隐患，不是当时的瓶颈）
+
+| 项 | 改前 | 最终 |
+|---|---|---|
+| `memory_consumption` | 128MB | **384MB**（≤12 站统一 384，之后 512 / 768） |
+| 已用 / 剩余 | **126.2MB / 1.8MB** | 64–81MB / 303–320MB |
+| `cached_scripts` | 3073 | 755–2022（重启后重新灌） |
+| 命中率 | 98.8% | **99.7%** |
+| `wasted_memory` | 0MB（尚未开始淘汰） | 0MB |
+
+只剩 1.8MB 意味着**下一个新脚本进来就要淘汰旧条目、下次再重编译**。这是一条迟早会踩的线，不是当下的瓶颈——扩到 256MB 时动态路径 RPS 完全没变（22.2 → 22.2）。
+
+**「小站也开大段」为什么几乎零成本**：OPcache 与 APCu 的共享段都是 mmap 匿名页、按需缺页分配。声明 384MB 不等于立刻占 384MB 物理内存，只有真正缓存的脚本才占页——实测 6 站灌满后只用了 64–81MB。所以按「2 站够用」去配 128MB 反而是白亏，直接给 384MB。
+
+### 7.3 一档到底的性能参数（2–6 站 / 1 核）
+
+| 参数 | 默认值 | 最终值 | 依据 |
+|---|---|---|---|
+| `opcache.memory_consumption` | 128 | **384** | 按需分配，写满才是灾难 |
+| `opcache.interned_strings_buffer` | 8 | **32** | 同样在共享段内按需分配 |
+| `opcache.max_accelerated_files` | 10000 | **40000** | 实际 2000–3000，留足余量免哈希冲突 |
+| `opcache.revalidate_freq` | 2 | **60** | 每文件每 60s 才 stat 一次 |
+| `opcache.jit_buffer_size` | 0 | **128M** | 见 7.4，实测 +15% |
+| `realpath_cache_size` | 4096K | **16384K** | WP 每请求 resolve 上千路径 |
+| `realpath_cache_ttl` | 120 | **600** | 同上，减少回落到 stat |
+| `memory_limit` | 128M | **256M** | 后台/导入/插件更新容易打满白屏 |
+| `apc.shm_size` | 128M | **256M** | 按需分配 |
+| `apc.ttl` | 7200 | **0** | 不按时间过期，写满才 LRU 淘汰 |
+| `apc.entries_hint` | 8192 | **16384** | 哈希桶数，减少碰撞 |
+
+`validate_timestamps` **保持开启**：关掉能再省一点 stat，但改主题/插件后必须手动清 OPcache，对「随时改代码」的站群不划算。
+
+### 7.4 JIT：原以为无用，实测有效
+
+上一版这里写的是「1 核上 WP 收益极小，保持关闭」——**这是错的，已用交替对照推翻**。
+
+同一台机器、同一探针，开 → 关 → 开 → 关 → 开 交替五轮，每轮重启 + 预热 20 次后跑 40 个请求：
+
+| 轮次 | JIT | `load_ms` | `work_ms` | 串行 RPS |
+|---|---|---|---|---|
+| ON-1 | 开 | 31.7 | 0.46 | 26.3 |
+| OFF-1 | 关 | 36.3 | 0.69 | 23.5 |
+| ON-2 | 开 | 38.2 | 0.52 | 21.7 |
+| OFF-2 | 关 | 37.8 | 0.72 | 23.1 |
+| ON-3 | 开 | 32.4 | 0.46 | 26.6 |
+| **中位** | 开 / 关 | **32.4 / 37.1** | **0.46 / 0.71** | **26.3 / 23.3** |
+
+怎么读：
+
+- **`work_ms` 是最干净的信号**（60 次 `get_option` 的紧循环）：开 0.46–0.52，关 0.69–0.72，**−35%**，五轮零重叠。JIT 编译的就是这类计算密集代码。
+- **`load_ms` 有波动**：ON-2 那轮跑到 38.2ms（重启后 JIT 尚未热起来，40 个请求里含着预热成本）。三轮中位 32.4 vs 两轮 37.1，**约 −12%**，方向一致但不宜当精确值。
+- JIT 缓冲区在 opcache 段内按需分配：128MB 声明值，实际编译 WP 全部热函数后只占 **0.9MB**。所以「128M 很贵」是误解。
+- 128M 比 64M 略好（`load_ms` 33.4 vs 34.3），成本只多约 1MB 页，直接给 128M。
+
+### 7.5 PHP 子进程数：10 → 6 → 又改回 10
+
+`maxConns 10 / PHP_LSAPI_CHILDREN=10` 在 1 核上看着浪费，于是做了对照：
+
+| 指标 | children=10 | children=6 |
+|---|---|---|
+| 动态串行 RPS（c=1） | 22.2 | 22.1 |
+| 动态并发 RPS（c=8） | 20.7 / 21.7 | 17.7 / 19.5 |
+| 动态并发 p95 | **440–485ms** | 568–654ms |
+| lsphp PSS 合计 | 181MB | 110MB |
+
+省 70MB，换来 20% 的尾延迟恶化。**机器还有 1GB 可用内存，不值得**，最终保持 10。
+
+### 7.6 没改的两项（有实测依据）
+
+- **SQLite `cache_size=-2000`（约 2MB）**：库本身只有 0.6–0.7MB（ww2 12.5MB），2MB 页面缓存已经装得下热数据。而 SQLite 的 page cache 是**每连接**一份，调到 8MB × 10 个子进程 = 多占 80MB，纯亏。
+- **`mmap_size=0`**：mmap 能让多进程共享同一份页缓存，但 WAL 模式下收益有限、且和 SQLite 插件的 `busy_timeout` 路径叠加后不易验证。不动。
+
+### 7.7 最终数字（site1，两轮反向顺序）
+
+| 指标 | 优化前 | 最终（性能优先档 + JIT） | 变化 |
+|---|---|---|---|
+| 动态串行 RPS（c=1） | 16.7 | **24.7–26.6**（中位 25.5） | **+53%** |
+| 动态串行 p50 | 55.3ms | 35.6–42.6ms（中位 37.5） | −32% |
+| 动态并发 RPS（c=8） | 15.0 | 21.9–25.5 | **+46%** |
+| 动态并发 p95 | 669.9ms | 358–540ms | −19% ~ −47% |
+| WP 启动 `load_ms` | 37–38ms | 31.7–32.4ms（中位 32.4） | −12% |
+| `work_ms`（纯 PHP 逻辑） | 6.73 | **0.46** | −93% |
+| 整页缓存 RPS（c=8） | 708.1 | 647–783 | 同量级 |
+| 整页缓存 p50 | 10.1ms | 8.9–11.2ms | 同量级 |
+
+拆开看谁贡献了什么：
+
+| 改动 | 动态路径贡献 |
+|---|---|
+| 拆掉 flying-press / nginx-helper | **+33%**（最大一笔） |
+| APCu 对象缓存四站生效 | 含在上面 |
+| JIT 128M | **+12~13%**（load_ms 37.1 → 32.4，work_ms −35%） |
+| OPcache 扩容 / realpath / memory_limit / APCu 扩容 | 测不出差异（≈0），属于消除隐患 |
+
+**为什么 OPcache 那批「改大」测不出提升**：命中率本来就有 99.7%、`wasted` 是 0，没有可挽回的损失。它们的价值是「不再逼近写满」和「后台重活不白屏」，不是当下的吞吐。这一点必须说清楚，不能拿参数变大冒充变快。
+
+**整页缓存 700+ RPS 与 PHP 参数无关**：OLS 直接吐 HTML，PHP 不启动。所以「让匿名访客更快」只有两条路——拆掉抢缓存/发 `no-store` 的插件、把 TTFB 交给 Cloudflare 边缘。
+
+### 7.8 复现方式
+
+```bash
+wp-cluster tune                # 只报告：当前值 vs 建议值、PHP 池 PSS、站点数
+wp-cluster tune --apply        # 写 php.ini + 40-apcu.ini（幂等，自动备份）
+wp-cluster tune --apply --yes  # 写完后重启 LSPHP 子进程生效
+wp-cluster tune --apply --yes --no-jit   # 不想要 JIT 时（回退到 22 RPS 档）
+wp-cluster doctor              # OPcache 容量不足会给警告并提示 tune --apply
+```
+
+新装机器由 `install-wp-cluster.sh` 的 `tune_php_ini()` 直接写入同一套值，不需要事后补。
+
+## 8. 相关文档
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 组件分层、隔离边界、请求路径、状态模型
 - [DOCKER-VS-NATIVE.md](DOCKER-VS-NATIVE.md) — 为什么 1 核 1.4G 选原生栈而不是 Docker

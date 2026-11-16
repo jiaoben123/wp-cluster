@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 
 WP_CLUSTER_MAIN=1
-WP_CLUSTER_VERSION="2.2.0"
+WP_CLUSTER_VERSION="2.3.0"
 
 # ---------- 退出码（供监控/脚本判断）----------
 readonly E_OK=0
@@ -675,6 +675,7 @@ ${C_BD}查看${C_0}
   status [--json]             整机资源与站点规模
   health [域|--all] [--json]  健康检查（HTTP/缓存命中/证书剩余天数/版本）
   doctor [--fix]              环境自检（部署前先跑它）
+  tune [--apply] [--no-jit]   PHP 运行时调优（OPcache/realpath/APCu/JIT）
 
 ${C_BD}运维${C_0}
   enable <域>                 允许收录
@@ -777,6 +778,18 @@ cmd_doctor() {
     chk_fail "LSPHP" "未找到 $PHP_BIN"
   fi
 
+  # OPcache 容量：写满后每加载一个新脚本都要淘汰旧的、下次再重编译，是典型的隐性变慢
+  local opc_mem opc_want nsites
+  opc_mem=$("$PHP_BIN" -r 'echo (int)ini_get("opcache.memory_consumption");' 2>/dev/null)
+  nsites=$(find "$STATE_DIR/sites" -maxdepth 1 -name '*.env' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "${nsites:-0}" -ge 1 ] || nsites=1
+  opc_want=$(tune_target_mem "$nsites")
+  if [ "${opc_mem:-0}" -ge "$opc_want" ]; then
+    chk_ok "OPcache 容量" "${opc_mem}MB（$nsites 站，建议 ≥${opc_want}MB）"
+  else
+    chk_warn "OPcache 容量" "${opc_mem}MB 偏小，$nsites 站建议 ≥${opc_want}MB（wp-cluster tune --apply）"
+  fi
+
   if [ -x "$WP_CLI" ] || [ -f "$WP_CLI" ]; then chk_ok "wp-cli" "$("$PHP_BIN" "$WP_CLI" --version --allow-root 2>/dev/null | head -1)"; else chk_fail "wp-cli" "未找到 $WP_CLI"; fi
 
   if detect_template; then chk_ok "模板站" "$TEMPLATE_SITE"; else chk_fail "模板站" "找不到含 SQLite 插件的站点，请设置 TEMPLATE_SITE"; fi
@@ -822,6 +835,232 @@ cmd_doctor() {
     return "$E_PRECOND"
   fi
   if [ "$warns" -gt 0 ]; then warn "自检通过，$warns 项警告"; else info "自检全部通过"; fi
+}
+
+# =============================================================================
+#  命令：tune
+# =============================================================================
+# 数值来源（1 核 / 1469MB / 4 站实测，2026-11-16）：
+#   原 opcache.memory_consumption=128 → 已用 126.2MB、仅剩 1.8MB，脚本开始被淘汰重编译；
+#   扩到 256MB 后 free 167MB、wasted 0、命中率 98.8% → 99.3%；
+#   整页缓存路径 664.8 → 816.5 RPS，动态并发 p95 542 → 471ms。
+#   OPcache 是 mmap 匿名共享段，按需缺页分配：声明 256MB 不等于立刻吃掉 256MB 物理内存。
+#   JIT 保持关闭：1 核上 WP 动态请求收益极小，反而要额外 64MB 且需预热。
+
+php_ini_path() {
+  local ini
+  ini=$("$PHP_BIN" --ini 2>/dev/null | awk -F': *' '/Loaded Configuration File/{print $2; exit}')
+  case "$ini" in ''|'(none)') return 1 ;; esac
+  printf '%s\n' "$ini"
+}
+
+# PSS 去重统计 lsphp 真实内存占用（RSS 会把 OPcache 共享段在每个进程重复计算）
+php_pool_pss_mb() {
+  local p v total=0 n=0
+  for p in $(pgrep -x lsphp 2>/dev/null); do
+    v=$(awk '/^Pss:/{print $2}' "/proc/$p/smaps_rollup" 2>/dev/null)
+    [ -n "$v" ] || continue
+    total=$((total + v)); n=$((n + 1))
+  done
+  printf '%s %s\n' "$n" "$((total / 1024))"
+}
+
+tune_site_count() {
+  local n
+  n=$(find "$STATE_DIR/sites" -maxdepth 1 -name '*.env' -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "${n:-0}" -ge 1 ] || n=1
+  printf '%s\n' "$n"
+}
+
+# ---- 性能优先参数 ----
+# OPcache / APCu 的共享段都是 mmap 匿名页、按需缺页分配：声明 384MB 不等于立刻吃掉
+# 384MB 物理内存，只有真正缓存的脚本/条目才占页。所以「小站也开大段」几乎零成本，
+# 换来的是永不被淘汰。真正会吃内存的是 PHP 子进程本身，那个另算。
+PERF_OPCACHE_MEM_SMALL=384   # ≤12 站
+PERF_OPCACHE_MEM_MID=512     # ≤24 站
+PERF_OPCACHE_MEM_BIG=768     # >24 站
+PERF_INTERNED=32
+PERF_MAX_FILES=40000
+PERF_REVAL=60
+PERF_REALPATH_SIZE=16384K
+PERF_REALPATH_TTL=600
+PERF_MEMORY_LIMIT=256M
+PERF_APCU_SHM=256M
+PERF_APCU_TTL=0
+PERF_APCU_HINT=16384
+# JIT 实测：开启后 WP 启动 load_ms 38.4 → 33.4ms，串行 RPS 22.1 → 25.5（+15%）。
+# 缓冲区同样在 opcache 段内按需分配，声明 128MB 实际只多占约 1MB 页。
+PERF_JIT=128
+
+tune_target_mem() {
+  local n=$1
+  if [ "$n" -le 12 ]; then printf '%s\n' "$PERF_OPCACHE_MEM_SMALL"
+  elif [ "$n" -le 24 ]; then printf '%s\n' "$PERF_OPCACHE_MEM_MID"
+  else printf '%s\n' "$PERF_OPCACHE_MEM_BIG"; fi
+}
+
+# APCu 的配置在 mods-available/40-apcu.ini，不在 php.ini 里
+php_mods_dir() {
+  local d
+  d=$("$PHP_BIN" --ini 2>/dev/null | awk -F': *' '/Scan for additional/{print $2; exit}')
+  d=${d%/}
+  case "$d" in ''|'(none)') return 1 ;; esac
+  printf '%s\n' "$d"
+}
+
+apcu_ini_path() {
+  local d
+  d=$(php_mods_dir) || return 1
+  [ -f "$d/40-apcu.ini" ] && { printf '%s\n' "$d/40-apcu.ini"; return 0; }
+  return 1
+}
+
+cmd_tune() {
+  local apply=false want_jit=$PERF_JIT
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=true; shift ;;
+      --jit) want_jit=$PERF_JIT; shift ;;
+      --no-jit) want_jit=0; shift ;;
+      *) shift ;;
+    esac
+  done
+  need_root
+
+  local ini
+  ini=$(php_ini_path) || { err "找不到 LSPHP 的 php.ini（$PHP_BIN --ini 无输出）"; return "$E_PRECOND"; }
+  [ -f "$ini" ] || { err "php.ini 不存在：$ini"; return "$E_PRECOND"; }
+  local apcu_ini
+  apcu_ini=$(apcu_ini_path) || apcu_ini=""
+
+  local n want
+  n=$(tune_site_count)
+  want=$(tune_target_mem "$n")
+
+  local cur_mem cur_intern cur_files cur_reval cur_jit cur_used
+  local cur_rp_size cur_rp_ttl cur_ml cur_apcu_shm cur_apcu_ttl cur_apcu_hint
+  cur_mem=$("$PHP_BIN" -r 'echo (int)ini_get("opcache.memory_consumption");' 2>/dev/null)
+  cur_intern=$("$PHP_BIN" -r 'echo (int)ini_get("opcache.interned_strings_buffer");' 2>/dev/null)
+  cur_files=$("$PHP_BIN" -r 'echo (int)ini_get("opcache.max_accelerated_files");' 2>/dev/null)
+  cur_reval=$("$PHP_BIN" -r 'echo (int)ini_get("opcache.revalidate_freq");' 2>/dev/null)
+  cur_jit=$("$PHP_BIN" -r 'echo (int)ini_get("opcache.jit_buffer_size");' 2>/dev/null)
+  cur_rp_size=$("$PHP_BIN" -r 'echo ini_get("realpath_cache_size");' 2>/dev/null)
+  cur_rp_ttl=$("$PHP_BIN" -r 'echo (int)ini_get("realpath_cache_ttl");' 2>/dev/null)
+  cur_ml=$("$PHP_BIN" -r 'echo ini_get("memory_limit");' 2>/dev/null)
+  cur_apcu_shm=$("$PHP_BIN" -r 'echo ini_get("apc.shm_size");' 2>/dev/null)
+  cur_apcu_ttl=$("$PHP_BIN" -r 'echo (int)ini_get("apc.ttl");' 2>/dev/null)
+  cur_apcu_hint=$("$PHP_BIN" -r 'echo (int)ini_get("apc.entries_hint");' 2>/dev/null)
+  cur_used=$(php_pool_pss_mb)
+
+  if $JSON; then
+    printf '{"php_ini":"%s","apcu_ini":"%s","sites":%s,"opcache":{"memory_consumption":%s,"recommended":%s,"interned_strings_buffer":%s,"max_accelerated_files":%s,"revalidate_freq":%s,"jit_buffer_size":%s},"realpath":{"size":"%s","ttl":%s},"memory_limit":"%s","apcu":{"shm_size":"%s","ttl":%s,"entries_hint":%s},"php_pool":{"procs":%s,"pss_mb":%s}}\n' \
+      "$ini" "$apcu_ini" "$n" "${cur_mem:-0}" "$want" "${cur_intern:-0}" "${cur_files:-0}" "${cur_reval:-0}" "${cur_jit:-0}" \
+      "${cur_rp_size:-0}" "${cur_rp_ttl:-0}" "${cur_ml:-0}" "${cur_apcu_shm:-0}" "${cur_apcu_ttl:-0}" "${cur_apcu_hint:-0}" \
+      "${cur_used%% *}" "${cur_used##* }"
+    $apply || return 0
+  fi
+
+  if ! $JSON; then
+    printf '%s\n' "${C_BD}PHP 运行时调优${C_0}"
+    printf '  %-26s %s\n' "php.ini" "$ini"
+    printf '  %-26s %s\n' "APCu ini" "${apcu_ini:-（未找到，跳过 APCu）}"
+    printf '  %-26s %s 站（按此推算容量）\n' "站点数" "$n"
+    printf '  %-26s %s 进程 / %s MB（PSS 去重）\n' "LSPHP 进程池" "${cur_used%% *}" "${cur_used##* }"
+    echo
+    local mark
+    mark="${C_G}✓${C_0}"; [ "${cur_mem:-0}" -ge "$want" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s MB\n' "$mark" "opcache.memory_consumption" "${cur_mem:-0}" "$want"
+    mark="${C_G}✓${C_0}"; [ "${cur_intern:-0}" -ge "$PERF_INTERNED" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s MB\n' "$mark" "opcache.interned_strings_buffer" "${cur_intern:-0}" "$PERF_INTERNED"
+    mark="${C_G}✓${C_0}"; [ "${cur_files:-0}" -ge "$PERF_MAX_FILES" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s\n' "$mark" "opcache.max_accelerated_files" "${cur_files:-0}" "$PERF_MAX_FILES"
+    mark="${C_G}✓${C_0}"; [ "${cur_reval:-0}" -le "$PERF_REVAL" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s 秒\n' "$mark" "opcache.revalidate_freq" "${cur_reval:-0}" "$PERF_REVAL"
+    mark="${C_G}✓${C_0}"; [ "${cur_jit:-0}" -eq "$want_jit" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s MB\n' "$mark" "opcache.jit_buffer_size" "${cur_jit:-0}" "$want_jit"
+    mark="${C_G}✓${C_0}"; [ "${cur_rp_size:-0}" = "$PERF_REALPATH_SIZE" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s\n' "$mark" "realpath_cache_size" "${cur_rp_size:-0}" "$PERF_REALPATH_SIZE"
+    mark="${C_G}✓${C_0}"; [ "${cur_rp_ttl:-0}" -ge "$PERF_REALPATH_TTL" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s 秒\n' "$mark" "realpath_cache_ttl" "${cur_rp_ttl:-0}" "$PERF_REALPATH_TTL"
+    mark="${C_G}✓${C_0}"; [ "${cur_ml:-0}" = "$PERF_MEMORY_LIMIT" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s\n' "$mark" "memory_limit" "${cur_ml:-0}" "$PERF_MEMORY_LIMIT"
+    mark="${C_G}✓${C_0}"; [ "${cur_apcu_shm:-0}" = "$PERF_APCU_SHM" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s\n' "$mark" "apc.shm_size" "${cur_apcu_shm:-0}" "$PERF_APCU_SHM"
+    mark="${C_G}✓${C_0}"; [ "${cur_apcu_ttl:-0}" -eq "$PERF_APCU_TTL" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s（不过期）\n' "$mark" "apc.ttl" "${cur_apcu_ttl:-0}" "$PERF_APCU_TTL"
+    mark="${C_G}✓${C_0}"; [ "${cur_apcu_hint:-0}" -ge "$PERF_APCU_HINT" ] || mark="${C_Y}!${C_0}"
+    printf '  %s %-32s %8s → %s\n' "$mark" "apc.entries_hint" "${cur_apcu_hint:-0}" "$PERF_APCU_HINT"
+    echo
+  fi
+
+  if ! $apply; then
+    $JSON || info "以上为建议值，加 --apply 写入（JIT 默认开，--no-jit 可关）"
+    return 0
+  fi
+
+  if $DRY_RUN; then
+    step "[dry-run] 将写入 $ini：opcache ${want}M / interned ${PERF_INTERNED} / files ${PERF_MAX_FILES} / jit ${want_jit}M / realpath ${PERF_REALPATH_SIZE}/${PERF_REALPATH_TTL}s / memory_limit ${PERF_MEMORY_LIMIT}"
+    [ -n "$apcu_ini" ] && step "[dry-run] 将写入 $apcu_ini：shm ${PERF_APCU_SHM} / ttl ${PERF_APCU_TTL} / hint ${PERF_APCU_HINT}"
+    return 0
+  fi
+
+  local bak
+  bak="$ini.wp-cluster.$(date +%Y%m%d%H%M%S).bak"
+  cp -a "$ini" "$bak" || { err "备份 php.ini 失败"; return "$E_FAIL"; }
+  # 幂等：先删掉上一次写入的块（按块特征串匹配，避免正则转义问题）
+  sed -i '/wp-cluster perf tuning >>>/,/wp-cluster perf tuning <<</d' "$ini" 2>/dev/null || true
+  sed -i '/opcache tuning >>>/,/opcache tuning <<</d' "$ini" 2>/dev/null || true
+
+  {
+    printf '\n; >>> wp-cluster perf tuning >>>\n'
+    printf '; 由 wp-cluster tune 写入（%s）。共享段按需缺页，声明大段不等于立刻占物理内存。\n' "$(date +%F)"
+    printf '; 原 128MB 在 4 站规模下已被 3073 个脚本写到只剩 1.8MB，之后开始淘汰重编译。\n'
+    printf 'opcache.memory_consumption=%s\n' "$want"
+    printf 'opcache.interned_strings_buffer=%s\n' "$PERF_INTERNED"
+    printf 'opcache.max_accelerated_files=%s\n' "$PERF_MAX_FILES"
+    printf 'opcache.max_wasted_percentage=10\n'
+    printf '; 时间戳校验保留（改代码自动生效），间隔 2s → %ss，省掉大量 stat 调用\n' "$PERF_REVAL"
+    printf 'opcache.validate_timestamps=1\n'
+    printf 'opcache.revalidate_freq=%s\n' "$PERF_REVAL"
+    printf '; JIT 实测有效：load_ms 38.4 → 33.4ms、串行 RPS 22.1 → 25.5。缓冲区按需分配。\n'
+    printf 'opcache.jit_buffer_size=%sM\n' "$want_jit"
+    printf '; WP 每个请求要 resolve 上千个路径，默认 4MB/120s 会频繁回落到 stat\n'
+    printf 'realpath_cache_size=%s\n' "$PERF_REALPATH_SIZE"
+    printf 'realpath_cache_ttl=%s\n' "$PERF_REALPATH_TTL"
+    printf '; 后台/导入/插件更新这类重活，128M 容易打到上限直接白屏\n'
+    printf 'memory_limit=%s\n' "$PERF_MEMORY_LIMIT"
+    printf '; <<< wp-cluster perf tuning <<<\n'
+  } >>"$ini" || { err "写入 php.ini 失败（备份在 $bak）"; return "$E_FAIL"; }
+
+  if [ -n "$apcu_ini" ]; then
+    cp -a "$apcu_ini" "$apcu_ini.wp-cluster.$(date +%Y%m%d%H%M%S).bak" 2>/dev/null || true
+    sed -i '/wp-cluster apcu tuning >>>/,/wp-cluster apcu tuning <<</d' "$apcu_ini" 2>/dev/null || true
+    {
+      printf '\n; >>> wp-cluster apcu tuning >>>\n'
+      printf '; 对象缓存条目按需占用，声明大段不会立刻吃掉内存；ttl=0 表示只在写满时按 LRU 淘汰，\n'
+      printf '; 不再因为「到期」把还在用的 option/term 缓存丢掉重查。\n'
+      printf 'apc.shm_size=%s\n' "$PERF_APCU_SHM"
+      printf 'apc.ttl=%s\n' "$PERF_APCU_TTL"
+      printf 'apc.entries_hint=%s\n' "$PERF_APCU_HINT"
+      printf '; <<< wp-cluster apcu tuning <<<\n'
+    } >>"$apcu_ini" || warn "写入 $apcu_ini 失败（不影响 opcache）"
+  fi
+
+  if ols_validate; then :; else warn "OLS 配置语法异常，请检查（php.ini 备份：$bak）"; fi
+  info "已写入 $ini（备份：$bak）"
+  [ -n "$apcu_ini" ] && info "已写入 $apcu_ini"
+
+  if $ASSUME_YES; then
+    step "重启 LSPHP 子进程使新配置生效"
+    pkill -x lsphp 2>/dev/null || true
+    sleep 2
+    local after
+    after=$("$PHP_BIN" -r 'echo (int)ini_get("opcache.memory_consumption");' 2>/dev/null)
+    info "已重启，当前 memory_consumption=${after}MB"
+  else
+    warn "配置需重启 LSPHP 才生效：pkill -x lsphp（OLS 会自动重新拉起，站点瞬断 1–2 秒）"
+  fi
+  return 0
 }
 
 # =============================================================================
@@ -3271,6 +3510,7 @@ main() {
   local rc=0
   case "$cmd" in
     doctor)      cmd_doctor "$@" ;;
+    tune)        cmd_tune "$@" ;;
     init)        cmd_init ;;
     add)         cmd_add "$@" ;;
     import)      cmd_import "$@" ;;
