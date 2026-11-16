@@ -68,6 +68,12 @@ on_error() {
   fi
   exit "$rc"
 }
+
+# 探测 wp-cli 版本：root 下必须带 --allow-root，且失败时不得触发 ERR trap
+wp_cli_version() {
+  ( set +e; set +o pipefail
+    "$PHP_BIN" "$WP_CLI" --version --allow-root 2>/dev/null | head -1 )
+}
 trap 'on_error $? $LINENO' ERR
 
 usage() {
@@ -261,13 +267,14 @@ enable_lsws() {
 install_wpcli() {
   step "WP-CLI"
   if [ -x "$WP_CLI" ]; then
-    skip "已安装：$("$PHP_BIN" "$WP_CLI" --version 2>/dev/null | head -1)"
+    local v; v=$(wp_cli_version)
+    if [ -n "$v" ]; then skip "已安装：$v"; else skip "已安装：$WP_CLI（版本探测失败，可直接使用）"; fi
     return 0
   fi
   curl -fsSL --max-time 60 https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
     -o "$WP_CLI" || die "下载 wp-cli 失败"
   chmod 755 "$WP_CLI"
-  ok "已安装：$("$PHP_BIN" "$WP_CLI" --version 2>/dev/null | head -1)"
+  ok "已安装：$(wp_cli_version)"
 }
 
 # =============================================================================
@@ -289,8 +296,8 @@ fetch_repo() {
     skip "已存在旧版本，已备份为 wp-cluster.bak.*"
   fi
   # 只覆盖仓库跟踪的文件，保留 logs/ 等运行期产物
-  cp -a "$src/wp-cluster" "$src/install.sh" "$src/README.md" "$src/CHANGELOG.md" \
-        "$src/VERSION" "$src/LICENSE" "$INSTALL_DIR"/ 2>/dev/null || true
+  cp -a "$src/wp-cluster" "$src/install.sh" "$src/install-wp-cluster.sh" \
+        "$src/README.md" "$src/CHANGELOG.md" "$src/VERSION" "$src/LICENSE" "$INSTALL_DIR"/ 2>/dev/null || true
   cp -a "$src/conf" "$src/docs" "$src/tests" "$INSTALL_DIR"/ 2>/dev/null || true
   rm -rf "$tmp"
   chmod 755 "$INSTALL_DIR/wp-cluster" "$INSTALL_DIR/install.sh"
@@ -335,7 +342,7 @@ ensure_template() {
   if [ ! -f "$TEMPLATE_DIR/wp-load.php" ]; then
     "$PHP_BIN" "$WP_CLI" core download --path="$TEMPLATE_DIR" --locale=zh_CN \
       --allow-root >>"$LOG_FILE" 2>&1 || die "下载 WordPress 核心失败"
-    ok "WordPress $("$PHP_BIN" "$WP_CLI" --path="$TEMPLATE_DIR" --allow-root core version 2>/dev/null)"
+    ok "WordPress $( ( set +e; set +o pipefail; "$PHP_BIN" "$WP_CLI" --path="$TEMPLATE_DIR" --allow-root core version 2>/dev/null ) )"
   else
     skip "核心文件已存在"
   fi
@@ -497,7 +504,12 @@ if [ "$MODE" = "check" ]; then
   [ -x "$LSWS_HOME/bin/lshttpd" ] && ok "OLS: $("$LSWS_HOME/bin/lshttpd" -v 2>/dev/null | head -1)" || warn "OLS 未安装"
   dpkg -s lsphp83 >/dev/null 2>&1 && ok "lsphp83 已安装" || warn "lsphp83 未安装"
   [ -x "$PHP_BIN" ] && ok "PHP: $("$PHP_BIN" -r 'echo PHP_VERSION;')" || warn "PHP 可执行缺失"
-  [ -x "$WP_CLI" ] && ok "wp-cli: $("$PHP_BIN" "$WP_CLI" --version 2>/dev/null)" || warn "wp-cli 未安装"
+  if [ -x "$WP_CLI" ]; then
+    wpc_v=$(wp_cli_version)
+    [ -n "$wpc_v" ] && ok "wp-cli: $wpc_v" || ok "wp-cli: $WP_CLI（版本探测失败）"
+  else
+    warn "wp-cli 未安装"
+  fi
   [ -f "$INSTALL_DIR/wp-cluster" ] && ok "wp-cluster: $(cat "$INSTALL_DIR/VERSION" 2>/dev/null)" || warn "wp-cluster 未安装"
   systemctl is-active --quiet lsws && ok "lsws: 运行中" || warn "lsws: 未运行"
   echo
