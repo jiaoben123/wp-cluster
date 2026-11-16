@@ -259,6 +259,29 @@ CF_PROBE_TARGETS=cf.090227.xyz,cf-cname.xingpingcn.top,...
 > `TEMPLATE_STRIP_MU` 只写文件名、可逗号分隔多个。模板站如果自带「无条件 noindex」的 mu-plugin，
 > 不跳过它的话，`wp-cluster enable` 会把注册表改成「允许收录」但页面依旧 noindex。
 
+### 自更新地址从哪来
+
+`wp-cluster self-update` 按 **环境变量 → 配置文件 → 标记文件 → 内置默认** 的顺序解析，并会把命中的
+来源一起打印出来：
+
+```bash
+$ wp-cluster self-update
+→ 从上游获取最新版本：https://raw.githubusercontent.com/jiaoben123/wp-cluster/main/wp-cluster
+  来源：/etc/wp-cluster/update-url
+[+] 当前 2.2.0 → 上游 2.2.0
+[+] 更新完成，已生效
+```
+
+配置文件里的 `SELF_UPDATE_URL` 优先级高于一行命令写入的 `/home/.wp-cluster-update-url`，
+**旧值残留会静默盖掉新地址**（安装器检测到不一致会告警）。换仓库或换分支后如果 `self-update`
+仍从旧地址拉取，先把 `SELF_UPDATE_URL` 置空：
+
+```bash
+sed -i 's#^SELF_UPDATE_URL=.*#SELF_UPDATE_URL=""#' /etc/wp-cluster/wp-cluster.conf
+```
+
+另：`raw.githubusercontent.com` 有分钟级 CDN 缓存，刚 push 完立刻拉取可能拿到上一版，等 1～2 分钟即可。
+
 ---
 
 ## 测试
