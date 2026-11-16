@@ -1575,6 +1575,35 @@ cmd_health() {
 # =============================================================================
 #  命令：enable / disable / purge
 # =============================================================================
+# 在 Web 侧失效对象缓存。
+# wp-cli 与 LSPHP 的 APCu 是两个进程空间：`wp cache flush` / `litespeed-purge all`
+# 都只清得到 CLI 那份和页面缓存，前端仍会拿缓存里的旧 blog_public（表现为
+# enable 之后依旧 noindex、sitemap 空）。必须让 Web 进程自己 flush 一次。
+web_flush_object_cache() {
+  local domain=$1 dir=$2 url token probe key i
+  [ -f "$dir/wp-load.php" ] || return 1
+  url=$(site_get "$domain" URL)
+  url=${url%/}
+  key=$(printf '%s%s' "$$" "$RANDOM" | sha256sum | cut -c1-16)
+  token="__wpcluster_oc_${key}.php"
+  probe="$dir/$token"
+  cat >"$probe" <<PHP
+<?php
+if ( ! isset(\$_GET['k']) || \$_GET['k'] !== '$key' ) { http_response_code(403); exit; }
+require_once __DIR__ . '/wp-load.php';
+if ( function_exists( 'wp_cache_flush' ) ) { wp_cache_flush(); }
+if ( function_exists( 'apcu_clear_cache' ) ) { @apcu_clear_cache(); }
+echo 'OK';
+PHP
+  chmod 644 "$probe" 2>/dev/null || true
+  # LSPHP 可能 fork 了多个子进程，多次请求尽量覆盖各个 APCu 段
+  for i in 1 2 3 4 5 6; do
+    curl -fsS --max-time 8 "$url/$token?k=$key&cb=$i.$RANDOM" >/dev/null 2>&1 || true
+  done
+  rm -f "$probe"
+  return 0
+}
+
 cmd_set_index() {
   local domain=$1 want=$2
   require_site "$domain"
@@ -1591,15 +1620,19 @@ cmd_set_index() {
   site_set "$domain" INDEX "$want"
   wp_quiet "$dir" litespeed-purge all >/dev/null 2>&1 || true
   if $DRY_RUN; then return 0; fi
+  web_flush_object_cache "$domain" "$dir" || true
   local meta
   meta=$(curl -s --max-time 12 "$(site_get "$domain" URL)/" 2>/dev/null | grep -oiE '<meta[^>]*robots[^>]*>' | head -1)
   if [ -n "$meta" ]; then printf '  当前 meta: %s\n' "$meta"; fi
   if [ "$want" = "1" ] && [ -n "$meta" ] && printf '%s' "$meta" | grep -qi 'noindex'; then
-    warn "已放开收录，但页面仍在输出 noindex（有其它插件在写 robots）"
+    warn "已放开收录，但页面仍在输出 noindex"
+    printf '  排查顺序: ① APCu/Redis 对象缓存是否仍持有旧 blog_public（Web 侧已尝试 flush）\n'
+    printf '            ② 站点 mu-plugin 是否在写 wp_robots / rank_math/frontend/robots\n'
+    printf '            ③ wp-config.php 是否残留 WB_FORCE_NOINDEX\n'
     local hits
     hits=$(grep -rl --include='*.php' -e 'wp_robots' -e 'rank_math/frontend/robots' \
       "$dir/wp-content/mu-plugins" "$dir/wp-content/plugins" 2>/dev/null | xargs -r -n1 basename | sort -u | paste -sd, -)
-    [ -n "$hits" ] && printf '  可疑来源: %s\n' "$hits"
+    [ -n "$hits" ] && printf '  可疑 mu-plugin: %s\n' "$hits"
     printf '  处理办法: 删除可疑的 mu-plugin，或把它写进配置 TEMPLATE_STRIP_MU（建站时自动跳过）\n'
   fi
   return 0

@@ -32,6 +32,15 @@
 - **`self-update` 增加地址来源提示**：输出「来源：环境变量 / 配置文件 / 标记文件路径 / 内置默认」。
   配置文件里残留的旧 `SELF_UPDATE_URL` 优先级高于标记文件，会静默盖掉新地址；安装器在写入标记后
   会检测并告警。
+- **`enable` / `disable` 收录开关被 APCu 对象缓存挡住**（ww2 实测发现）：站点装了
+  `apcu-manager` 的 `object-cache.php` drop-in 时，wp-cli 与 LSPHP 的 APCu 是两个进程空间，
+  `wp cache flush` 只清得到 CLI 那份，`litespeed-purge all` 只清页面缓存。于是 `wp-cluster enable`
+  改完 `blog_public=1` 后，前端仍读到缓存里的 0 —— 继续 `noindex,nofollow`、sitemap 为空，
+  命令还把原因误判为「有其它插件在写 robots」。新增 `web_flush_object_cache()`：临时放一个带
+  key 校验的探针，经站点 URL 由 **Web 进程**执行 `wp_cache_flush()` + `apcu_clear_cache()`
+  （多次请求覆盖 fork 出的多个 LSPHP 子进程），用完即删。告警文案改为按「对象缓存 → mu-plugin
+  → wp-config 常量」顺序排查。实测 `enable` → `index, follow, max-snippet:-1` + 6 张子 sitemap，
+  `disable` → `noindex, nofollow` + 空 sitemap，可完整还原。
 
 ### 变更
 - `SELF_UPDATE_URL` 默认值改为空，交由 `resolve_update_url()` 解析；默认指向
