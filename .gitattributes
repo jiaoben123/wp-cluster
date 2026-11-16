@@ -1,0 +1,4 @@
+* text=auto
+*.sh text eol=lf
+wp-cluster text eol=lf
+*.md text eol=lf

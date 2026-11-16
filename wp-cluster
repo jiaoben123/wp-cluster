@@ -1,0 +1,3261 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  wp-cluster — WordPress 站群管理工具
+#  栈：OpenLiteSpeed + LSPHP + SQLite + APCu + LSCache (+ Cloudflare)
+#  目标：单机批量部署互相独立的 WordPress 站点，磁盘/内存开销最小化
+#  许可：MIT
+# =============================================================================
+#  设计要点
+#  1. 状态注册表：每站一份 /etc/wp-cluster/sites/<domain>.env，工具只信它，
+#     OLS 配置由工具生成；不再反向解析配置文件，避免格式漂移。
+#  2. WP 核心硬链接共享：所有站点共用一份 wp-admin/wp-includes，新建站仅 +5MB。
+#  3. 幂等：任何命令可重复执行；变更前自动备份配置，校验失败自动回滚。
+#  4. 全局 flock：并发执行会排队，不会写坏配置。
+#  5. 变更类命令支持 --dry-run，先看计划再落地。
+# =============================================================================
+set -Eeuo pipefail
+
+WP_CLUSTER_MAIN=1
+WP_CLUSTER_VERSION="2.2.0"
+
+# ---------- 退出码（供监控/脚本判断）----------
+readonly E_OK=0
+readonly E_FAIL=1        # 一般失败
+readonly E_USAGE=2       # 参数错误
+readonly E_PRECOND=3     # 前置条件不满足（未 init、缺依赖）
+readonly E_EXISTS=4      # 已存在
+readonly E_NOENT=5       # 不存在
+readonly E_LOCK=6        # 锁冲突
+readonly E_VALIDATE=7    # 配置校验失败
+readonly E_EXTERNAL=8    # 外部命令失败
+
+# =============================================================================
+#  默认配置（可被 /etc/wp-cluster/wp-cluster.conf 覆盖）
+# =============================================================================
+WWW_ROOT="/var/www"
+CORE_DIR="/var/www/wp-core"
+DB_DIR="/var/www/db"
+STATE_DIR="/etc/wp-cluster"
+BACKUP_DIR="/var/backups/wp-cluster"
+LOG_DIR="/var/log/wp-cluster"
+LOCK_FILE="/var/lock/wp-cluster.lock"
+LOCK_TIMEOUT=1800
+
+LSWS_HOME="/usr/local/lsws"
+LSWS_CONF="$LSWS_HOME/conf/httpd_config.conf"
+VHOST_DIR="$LSWS_HOME/conf/vhosts"
+CERT_DIR="$LSWS_HOME/conf/cert"
+PHP_BIN="/usr/local/lsws/lsphp83/bin/php"
+WP_CLI="/usr/local/bin/wp"
+
+WEB_USER="nobody"
+WEB_GROUP="nogroup"
+TEMPLATE_SITE=""                 # 留空则自动探测
+PORT_START=8100
+PORT_END=8199
+DEFAULT_PHP_MEMORY="128M"
+HARDLINK_PLUGINS=true
+# 建站时跳过模板里这些 mu-plugin（逗号分隔，只写文件名）。
+# 典型场景：模板站带了一个「无条件 noindex」的 force-noindex.php，
+# 它会让 wp-cluster 的收录开关失效（enable 之后依然 noindex），必须拦在建站阶段。
+TEMPLATE_STRIP_MU="force-noindex.php"
+
+BACKUP_DAILY_KEEP=7
+BACKUP_WEEKLY_KEEP=4
+BACKUP_MONTHLY_KEEP=6
+
+# 故障隔离
+POOL_CHILDREN_DEFAULT=3          # isolate --php-pool 未指定时的 PHP 子进程数
+GUARD_INTERVAL="5min"            # guard 巡检间隔
+GUARD_FAIL_THRESHOLD=3           # 连续失败几次记为 CRITICAL
+
+# CF 优选 IP（cf probe 的候选目标，逗号分隔）
+CF_PROBE_TARGETS="cf.090227.xyz,cf-cname.xingpingcn.top,cf.877774.xyz,cloudflare.182682.xyz,icook.hk,time.is"
+CF_PROBE_ROUNDS=3
+
+# 自更新地址解析顺序：环境变量 > 配置文件 SELF_UPDATE_URL > 更新标记文件 > 内置默认
+# 标记文件由一行安装命令写入（/home/.wp-cluster-update-url），换仓库/换分支无需改代码
+UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/jiaoben123/wp-cluster/main/wp-cluster"
+UPDATE_URL_MARKERS=("/etc/wp-cluster/update-url" "/home/.wp-cluster-update-url" "$HOME/.wp-cluster-update-url")
+SELF_UPDATE_URL="${WP_CLUSTER_UPDATE_URL:-}"
+
+# 运行态
+DRY_RUN=false
+JSON=false
+ASSUME_YES=false
+QUIET=false
+VERBOSE=false
+NO_COLOR="${NO_COLOR:-}"
+CONFIG_FILE="${WP_CLUSTER_CONFIG:-/etc/wp-cluster/wp-cluster.conf}"
+LOG_FILE=""
+LOCK_FD=""
+
+# =============================================================================
+#  输出 / 日志
+# =============================================================================
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+  C_R=$'\033[0;31m'; C_G=$'\033[0;32m'; C_Y=$'\033[1;33m'
+  C_B=$'\033[0;34m'; C_D=$'\033[0;36m'; C_0=$'\033[0m'; C_BD=$'\033[1m'
+else
+  C_R=''; C_G=''; C_Y=''; C_B=''; C_D=''; C_0=''; C_BD=''
+fi
+
+_log_line() {
+  [ -n "$LOG_FILE" ] || return 0
+  [ -d "$LOG_DIR" ] && [ -w "$LOG_DIR" ] || return 0
+  printf '%s [%s] %s\n' "$(date '+%F %T')" "$1" "$2" >>"$LOG_FILE" 2>/dev/null || true
+}
+info()  { $QUIET || printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; _log_line INFO "$*"; return 0; }
+warn()  { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*" >&2; _log_line WARN "$*"; return 0; }
+err()   { printf '%s[x]%s %s\n' "$C_R" "$C_0" "$*" >&2; _log_line ERROR "$*"; return 0; }
+debug() { $VERBOSE || return 0; printf '%s[·]%s %s\n' "$C_D" "$C_0" "$*" >&2; _log_line DEBUG "$*"; return 0; }
+step()  { $QUIET || printf '%s→%s %s\n' "$C_B" "$C_0" "$*"; _log_line STEP "$*"; return 0; }
+
+die()      { err "$*"; exit "$E_FAIL"; }
+die_code() { local c=$1; shift; err "$*"; exit "$c"; }
+
+on_err() {
+  local code=$1 line=$2 cmd=$3
+  if [ "$code" -eq 0 ]; then code=$E_FAIL; fi
+  err "执行失败（退出码 $code，第 $line 行）：$cmd"
+  _log_line ERROR "code=$code line=$line cmd=$cmd"
+  exit "$code"
+}
+trap 'on_err $? $LINENO "$BASH_COMMAND"' ERR
+
+# 建站失败时清理半成品（仅在 add 流程中生效，成功写入注册表后置空）
+ADD_ROLLBACK=""
+ADD_DB=""
+ADD_VH=""
+ADD_CONF_BAK=""
+on_exit_cleanup() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "${ADD_ROLLBACK:-}" ]; then
+    if [ "${WP_CLUSTER_NO_ROLLBACK:-0}" = "1" ]; then
+      err "建站中断，已按 WP_CLUSTER_NO_ROLLBACK=1 保留现场：$ADD_ROLLBACK"
+      exit "$rc"
+    fi
+    err "建站中断，清理半成品（OLS 配置已回滚，注册表未写入）"
+    rm -rf "$ADD_ROLLBACK" 2>/dev/null || true
+    if [ -n "${ADD_DB:-}" ]; then rm -f "$ADD_DB" 2>/dev/null || true; fi
+    if [ -n "${ADD_VH:-}" ]; then rm -rf "$ADD_VH" 2>/dev/null || true; fi
+    if [ -n "${ADD_CONF_BAK:-}" ] && [ -f "$ADD_CONF_BAK" ]; then
+      cp -a "$ADD_CONF_BAK" "$LSWS_CONF" 2>/dev/null || true
+      rm -f "$ADD_CONF_BAK" 2>/dev/null || true
+      systemctl restart lsws >/dev/null 2>&1 || true
+    fi
+  fi
+  exit "$rc"
+}
+trap 'on_exit_cleanup' EXIT
+
+# =============================================================================
+#  基础工具
+# =============================================================================
+run() {
+  if $DRY_RUN; then printf '%s[dry-run]%s %s\n' "$C_D" "$C_0" "$*"; return 0; fi
+  debug "run: $*"
+  "$@"
+}
+
+# 从 stdin 读内容写文件（支持 dry-run）
+write_file() {
+  local path=$1 content
+  content=$(cat)
+  if $DRY_RUN; then
+    printf '%s[dry-run]%s 写入 %s (%s 字节)\n' "$C_D" "$C_0" "$path" "${#content}"
+    return 0
+  fi
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$content" >"$path"
+  debug "write: $path"
+}
+
+need_root() {
+  [ "${EUID:-$(id -u)}" -eq 0 ] || die_code "$E_PRECOND" "需要 root 权限运行（sudo wp-cluster $*）"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+rand_hex() { openssl rand -hex 32; }
+
+rand_pass() { openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 18; }
+
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+validate_domain() {
+  local d=${1,,}
+  case "$d" in
+    ""|*[!a-z0-9.-]*) return 1 ;;
+    .*|*.|*..*) return 1 ;;
+  esac
+  [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$ ]] || return 1
+  return 0
+}
+
+slugify() { printf '%s' "${1//[.-]/_}"; }
+
+validate_port() {
+  local p=$1
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  [ "$p" -ge 1024 ] && [ "$p" -le 65535 ] || return 1
+  return 0
+}
+
+port_in_use() {
+  local p=$1
+  grep -qE "address[[:space:]]+\*:$p\b" "$LSWS_CONF" 2>/dev/null && return 0
+  ss -tlnH 2>/dev/null | awk -v p=":$p" '$4 ~ p"$" {found=1} END {exit !found}' && return 0
+  return 1
+}
+
+next_free_port() {
+  local p=$PORT_START
+  while [ "$p" -le "$PORT_END" ]; do
+    if ! port_in_use "$p"; then printf '%s' "$p"; return 0; fi
+    p=$((p + 1))
+  done
+  die_code "$E_FAIL" "端口区间 $PORT_START-$PORT_END 已用尽，请调整配置"
+}
+
+get_public_ip() {
+  local ip=""
+  ip=$(curl -4 -s --max-time 6 https://api.ipify.org 2>/dev/null || true)
+  [ -z "$ip" ] && ip=$(curl -4 -s --max-time 6 https://ifconfig.me 2>/dev/null || true)
+  [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  printf '%s' "${ip:-127.0.0.1}"
+}
+
+shq() { printf '%s' "${1//\"/\\\"}"; }
+
+site_disk_kb() {
+  find "$1" -type f -printf '%n %b\n' 2>/dev/null \
+    | awk '{tot += $2; if ($1 > 1) sh += $2} END {printf "%d", (tot - sh) * 512 / 1024}'
+}
+
+human_size() {
+  local kb=${1:-0}
+  if   [ "$kb" -ge 1048576 ]; then awk -v k="$kb" 'BEGIN{printf "%.1fG", k/1048576}'
+  elif [ "$kb" -ge 1024 ];    then awk -v k="$kb" 'BEGIN{printf "%.1fM", k/1024}'
+  else printf '%sK' "$kb"; fi
+}
+
+fmt_sec() { awk -v t="${1:-0}" 'BEGIN{printf "%.3f", t+0}'; }
+
+http_code() {
+  local url=$1 timeout=${2:-12} code=""
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$timeout" "$url" 2>/dev/null) || true
+  [ -n "$code" ] || code="000"
+  printf '%s' "$code"
+}
+
+confirm() {
+  if $ASSUME_YES; then return 0; fi
+  [ -t 0 ] || die_code "$E_USAGE" "非交互环境请追加 --yes"
+  local ans
+  read -r -p "$1 (yes/no): " ans
+  [ "$ans" = "yes" ]
+}
+
+confirm_typed() {
+  if $ASSUME_YES; then return 0; fi
+  [ -t 0 ] || die_code "$E_USAGE" "非交互环境请追加 --yes"
+  local ans
+  read -r -p "$1 请输入 \"$2\" 确认: " ans
+  [ "$ans" = "$2" ]
+}
+
+tcp_wait() {
+  local port=$1 timeout=${2:-25} i=0
+  while [ "$i" -lt "$timeout" ]; do
+    ss -tlnH 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {f=1} END {exit !f}' && return 0
+    sleep 1; i=$((i + 1))
+  done
+  return 1
+}
+
+# =============================================================================
+#  配置加载
+# =============================================================================
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+    debug "已加载配置: $CONFIG_FILE"
+  fi
+  LOG_FILE="$LOG_DIR/wp-cluster.log"
+}
+
+# =============================================================================
+#  锁
+# =============================================================================
+acquire_lock() {
+  if $DRY_RUN; then return 0; fi
+  mkdir -p "$(dirname "$LOCK_FILE")"
+  exec {LOCK_FD}>"$LOCK_FILE" || die_code "$E_LOCK" "无法打开锁文件 $LOCK_FILE"
+  if ! flock -w "$LOCK_TIMEOUT" "$LOCK_FD"; then
+    die_code "$E_LOCK" "另一个 wp-cluster 进程正持有锁（等待 ${LOCK_TIMEOUT}s 超时）"
+  fi
+  debug "已获取全局锁"
+}
+
+# =============================================================================
+#  状态注册表
+# =============================================================================
+meta_file() { printf '%s/sites/%s.env' "$STATE_DIR" "$1"; }
+site_exists() { [ -f "$(meta_file "$1")" ]; }
+require_site() { site_exists "$1" || die_code "$E_NOENT" "站点不存在: $1（wp-cluster list 查看）"; }
+
+site_get() {
+  # 用行解析而非 source：值里含空格/特殊字符也不会出错，且兼容历史未加引号的文件
+  local f line key=$2
+  f=$(meta_file "$1")
+  [ -f "$f" ] || return 1
+  [[ "$key" =~ ^[A-Z_]+$ ]] || return 1
+  line=$(grep -m1 "^${key}=" "$f" 2>/dev/null) || return 1
+  [ -n "$line" ] || return 1
+  line=${line#*=}
+  line=${line#\"}
+  line=${line%\"}
+  printf '%s' "$line"
+}
+
+site_set() {
+  local domain=$1 key=$2 val=$3 f
+  [[ "$key" =~ ^[A-Z_]+$ ]] || die_code "$E_USAGE" "非法字段: $key"
+  f=$(meta_file "$domain")
+  site_exists "$domain" || die_code "$E_NOENT" "站点不存在: $domain"
+  if $DRY_RUN; then step "[dry-run] 更新 $domain.$key=$val"; return 0; fi
+  if grep -qE "^${key}=" "$f"; then
+    python3 - "$f" "$key" "$val" <<'PY'
+import sys
+f, k, v = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(f, encoding='utf-8').read().splitlines()
+out = [f'{k}="{v}"' if l.startswith(k + '=') else l for l in lines]
+open(f, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+PY
+  else
+    printf '%s="%s"\n' "$key" "$val" >>"$f"
+  fi
+}
+
+all_sites() {
+  local f
+  [ -d "$STATE_DIR/sites" ] || return 0
+  for f in "$STATE_DIR"/sites/*.env; do
+    [ -e "$f" ] || continue
+    basename "$f" .env
+  done | sort
+}
+
+site_count() { all_sites | wc -l | tr -d ' '; }
+
+# =============================================================================
+#  OLS 配置操作（python 状态机，避免正则误伤）
+# =============================================================================
+ols_conf() {
+  python3 - "$LSWS_CONF" "$@" <<'PY'
+import re, sys
+
+conf, action = sys.argv[1], sys.argv[2]
+args = sys.argv[3:]
+lines = open(conf, encoding='utf-8').read().splitlines()
+
+BLOCK = re.compile(r'^(virtualHost|listener)\s+(\S+?)\s*\{')
+
+def find_blocks():
+    out, cur = [], None
+    for i, l in enumerate(lines):
+        m = BLOCK.match(l)
+        if m and cur is None:
+            cur = [m.group(1), m.group(2), i]
+        elif cur is not None and l.strip() == '}':
+            cur.append(i)
+            out.append(tuple(cur))
+            cur = None
+    return out
+
+def write_back(new):
+    if new == lines:
+        return 0
+    open(conf, 'w', encoding='utf-8').write('\n'.join(new) + '\n')
+    return 1
+
+changed = 0
+domain = args[0] if args else ''
+
+if action == 'has':
+    for kind, name, s, e in find_blocks():
+        body = '\n'.join(lines[s:e + 1])
+        if kind == 'virtualHost' and name == domain:
+            sys.exit(0)
+        if kind == 'listener' and re.search(r'^\s*map\s+' + re.escape(domain) + r'\s', body, re.M):
+            sys.exit(0)
+    sys.exit(1)
+
+elif action == 'add_test':
+    site_dir, vh, port = args[1], args[2], args[3]
+    block = f"""
+virtualHost {domain} {{
+  vhRoot                  {site_dir}
+  configFile              {vh}
+  allowSymbolLink         1
+  enableScript            1
+  restrained              1
+}}
+
+listener L{port} {{
+  address                 *:{port}
+  secure                  0
+  map                     {domain} *
+}}
+"""
+    lines += block.rstrip('\n').splitlines()
+    changed = 1
+
+elif action == 'add_domain':
+    site_dir, vh = args[1], args[2]
+    if not any(k == 'virtualHost' and n == domain for k, n, s, e in find_blocks()):
+        block = f"""
+virtualHost {domain} {{
+  vhRoot                  {site_dir}
+  configFile              {vh}
+  allowSymbolLink         1
+  enableScript            1
+  restrained              1
+}}
+"""
+        lines += block.rstrip('\n').splitlines()
+        changed = 1
+    # 把 map 写进 80/443 共享 listener（取块内最后一条 map 之后，保持缩进）
+    inserts = []
+    for kind, name, s, e in find_blocks():
+        if kind != 'listener':
+            continue
+        body = lines[s:e]
+        if not any(re.match(r'\s*address\s+\*:(80|443)\s*$', b) for b in body):
+            continue
+        if any(re.match(r'\s*map\s+' + re.escape(domain) + r'\s', b) for b in body):
+            continue
+        idx, indent = None, '    '
+        for j, b in enumerate(body):
+            if re.match(r'\s*map\s+', b):
+                idx, indent = j, b[:len(b) - len(b.lstrip())]
+        if idx is None:
+            for j, b in enumerate(body):
+                if re.match(r'\s*secure\s+', b):
+                    idx, indent = j, b[:len(b) - len(b.lstrip())]
+        if idx is None:
+            idx = 0
+        inserts.append((s + idx + 1, indent))
+    for pos, indent in sorted(inserts, reverse=True):
+        lines.insert(pos, f'{indent}map                     {domain} *')
+        changed = 1
+
+elif action == 'remove':
+    drop = set()
+    for kind, name, s, e in find_blocks():
+        body = '\n'.join(lines[s:e + 1])
+        if kind == 'virtualHost' and name == domain:
+            drop.update(range(s, e + 1))
+        elif kind == 'listener' and re.search(r'^\s*map\s+' + re.escape(domain) + r'\s', body, re.M):
+            drop.update(range(s, e + 1))
+    new = [l for i, l in enumerate(lines) if i not in drop]
+    # 再清理共享 listener 里的 map 行
+    new = [l for l in new if not re.match(r'\s*map\s+' + re.escape(domain) + r'\s+\*\s*$', l)]
+    lines = new
+    changed = 1
+
+elif action == 'list':
+    for kind, name, s, e in find_blocks():
+        if kind != 'listener':
+            continue
+        body = lines[s:e + 1]
+        port = ''
+        for b in body:
+            m = re.match(r'\s*address\s+\*:(\d+)', b)
+            if m:
+                port = m.group(1)
+        maps = [m.group(1) for b in body if (m := re.match(r'\s*map\s+(\S+)\s', b))]
+        for d in maps:
+            print(f'{d}\t{port}')
+    sys.exit(0)
+
+else:
+    sys.exit(1)
+
+if changed:
+    open(conf, 'w', encoding='utf-8').write(chr(10).join(lines) + chr(10))
+sys.exit(0)
+PY
+}
+
+ols_validate() {
+  local rc=0 out
+  out=$("$LSWS_HOME/bin/lshttpd" -t 2>&1) || rc=$?
+  if printf '%s' "$out" | grep -qiE '\[(error|fatal)\]|syntax error|failed to start'; then
+    printf '%s\n' "$out" | grep -iE 'error|fatal|syntax|failed' | head -5 >&2
+    return 1
+  fi
+  return 0
+}
+
+# 变更 OLS 配置的原子封装：备份 → 执行 → 校验 → 失败回滚
+ols_txn() {
+  local desc=$1; shift
+  # dry-run 绝不能碰真实配置：ols_conf 会直接写文件，必须在这里拦住
+  if $DRY_RUN; then
+    step "[dry-run] $desc（不修改 OLS 配置）"
+    return 0
+  fi
+  local bak="$LSWS_CONF.bak.$(date +%Y%m%d%H%M%S).$$"
+  cp -a "$LSWS_CONF" "$bak"
+  if ! "$@"; then
+    err "$desc 失败"
+    cp -a "$bak" "$LSWS_CONF"; rm -f "$bak"
+    return 1
+  fi
+  if ! ols_validate; then
+    err "$desc 后配置校验不通过，已回滚"
+    cp -a "$bak" "$LSWS_CONF"; rm -f "$bak"
+    return 1
+  fi
+  rm -f "$bak"
+  return 0
+}
+
+ols_restart() {
+  if $DRY_RUN; then step "[dry-run] systemctl restart lsws"; return 0; fi
+  step "重启 OpenLiteSpeed（listener 变更需完整重启）"
+  systemctl restart lsws || die_code "$E_EXTERNAL" "OLS 重启失败，请检查 journalctl -u lsws"
+  tcp_wait 80 30 || warn "80 端口未在 30s 内监听"
+  systemctl is-active --quiet lsws || die_code "$E_EXTERNAL" "OLS 未处于 active 状态"
+  sleep 1
+}
+
+# =============================================================================
+#  WordPress 封装
+# =============================================================================
+wp_run() {
+  local path=$1; shift
+  "$PHP_BIN" "$WP_CLI" --path="$path" --allow-root "$@"
+}
+
+fix_owner_after_wp() {
+  local dir=$1 db
+  $DRY_RUN && return 0
+  db=$(awk -F"'" '/DB_PATH/{print $4; exit}' "$dir/wp-config.php" 2>/dev/null || true)
+  if [ -n "${db:-}" ]; then
+    find "$(dirname "$db")" -maxdepth 1 -name "$(basename "$db")*" -exec chown "$WEB_USER:$WEB_GROUP" {} + 2>/dev/null || true
+    [ -f "$db" ] && chmod 664 "$db" 2>/dev/null || true
+  fi
+  find "$dir" -maxdepth 1 \( -name '*.php' -o -name '.htaccess' \) -exec chown "$WEB_USER:$WEB_GROUP" {} + 2>/dev/null || true
+  return 0
+}
+
+wp_quiet() {
+  local path=$1; shift
+  if $DRY_RUN; then printf '%s[dry-run]%s wp %s\n' "$C_D" "$C_0" "$*"; return 0; fi
+  if "$PHP_BIN" "$WP_CLI" --path="$path" --allow-root "$@" >>"$LOG_DIR/wp-cli.log" 2>&1; then
+    fix_owner_after_wp "$path"
+    return 0
+  fi
+  fix_owner_after_wp "$path"
+  return 1
+}
+
+ensure_ownership() {
+  local dir=$1 db=${2:-}
+  if $DRY_RUN; then return 0; fi
+  chown -R "$WEB_USER:$WEB_GROUP" "$dir" 2>/dev/null || true
+  find "$dir" -type d -exec chmod 755 {} + 2>/dev/null || true
+  find "$dir" -type f -exec chmod 644 {} + 2>/dev/null || true
+  [ -n "$db" ] && [ -f "$db" ] && chmod 664 "$db" 2>/dev/null || true
+  [ -n "$db" ] && chown "$WEB_USER:$WEB_GROUP" "$(dirname "$db")" 2>/dev/null || true
+  return 0
+}
+
+# =============================================================================
+#  共享核心
+# =============================================================================
+detect_template() {
+  if [ -n "${TEMPLATE_SITE:-}" ] && [ -d "$TEMPLATE_SITE/wp-content/plugins/sqlite-database-integration" ]; then
+    return 0
+  fi
+  # 选“内容最丰富”的站点做模板：插件数优先，其次主题数、媒体文件
+  local d best="" best_score=-1 pc tc uc score
+  for d in "$WWW_ROOT"/*/; do
+    d=${d%/}
+    [ -d "$d/wp-content/plugins/sqlite-database-integration" ] || continue
+    [ -f "$d/wp-content/db.php" ] || continue
+    pc=$(find "$d/wp-content/plugins" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    tc=$(find "$d/wp-content/themes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    mc=$(find "$d/wp-content/mu-plugins" -maxdepth 1 -name '*.php' 2>/dev/null | wc -l)
+    uc=0
+    if [ -n "$(find "$d/wp-content/uploads" -type f -print -quit 2>/dev/null)" ]; then uc=1; fi
+    score=$((mc * 100 + pc * 10 + tc + uc))
+    if [ "$score" -gt "$best_score" ]; then best_score=$score; best=$d; fi
+  done
+  if [ -n "$best" ]; then
+    TEMPLATE_SITE=$best
+    debug "自动探测模板站: $TEMPLATE_SITE（评分 $best_score）"
+    return 0
+  fi
+  return 1
+}
+
+build_core() {
+  local items=(wp-admin wp-includes index.php wp-activate.php wp-blog-header.php
+    wp-comments-post.php wp-config-sample.php wp-cron.php wp-links-opml.php
+    wp-load.php wp-login.php wp-mail.php wp-settings.php wp-signup.php
+    wp-trackback.php xmlrpc.php license.txt readme.html)
+  local it
+
+  if [ -f "$CORE_DIR/wp-load.php" ]; then
+    info "共享核心已存在，跳过构建（$CORE_DIR）"
+    return 0
+  fi
+  step "构建共享核心目录（硬链接自 $TEMPLATE_SITE）"
+  run mkdir -p "$CORE_DIR"
+  for it in "${items[@]}"; do
+    [ -e "$TEMPLATE_SITE/$it" ] || continue
+    if $DRY_RUN; then continue; fi
+    cp -a --link "$TEMPLATE_SITE/$it" "$CORE_DIR/" 2>/dev/null || cp -a "$TEMPLATE_SITE/$it" "$CORE_DIR/"
+  done
+  chmod 755 "$CORE_DIR"
+  info "核心就绪：$(du -sh "$CORE_DIR" 2>/dev/null | awk '{print $1}')（全站共享一份）"
+}
+
+# =============================================================================
+#  命令：version / help
+# =============================================================================
+cmd_version() {
+  if $JSON; then
+    printf '{"name":"wp-cluster","version":"%s","stack":"ols+lsphp+sqlite+apcu+lscache"}\n' "$WP_CLUSTER_VERSION"
+    return 0
+  fi
+  printf '%s\n' "${C_BD}wp-cluster${C_0} $WP_CLUSTER_VERSION"
+  printf '  %s\n' "OpenLiteSpeed + LSPHP + SQLite + APCu + LSCache"
+  printf '  配置文件: %s\n' "$CONFIG_FILE"
+  printf '  状态目录: %s\n' "$STATE_DIR"
+}
+
+cmd_help() {
+  cat <<HELP
+${C_BD}wp-cluster${C_0} ${WP_CLUSTER_VERSION} — WordPress 站群管理（OLS + SQLite + APCu + LSCache）
+
+${C_BD}用法${C_0}
+  wp-cluster <命令> [参数] [全局选项]
+
+${C_BD}部署${C_0}
+  init                        初始化环境（目录、共享核心、mu-plugin、日志）
+  import [--all|域]           接管已存在的站点（生成注册表）
+  add <域> [选项]             新建站点
+      --mode port|domain        端口模式（默认，测试用）| 域名模式（80/443 共享）
+      --port N                  指定端口（默认自动分配 $PORT_START-$PORT_END）
+      --index                   允许搜索引擎收录（默认 noindex）
+      --title T                 站点标题（默认域名）
+      --admin-user U            管理员用户名（默认 admin）
+      --admin-email E           管理员邮箱（默认 admin@<域>）
+      --php-memory 128M         PHP 内存上限
+      --with-demo               生成演示内容（含伪静态）
+      --minimal                 只激活核心三件插件（mu-plugins 仍复制，主题依赖）
+      --mode domain --ssl       域名模式下同时签发 Let's Encrypt 证书
+
+${C_BD}查看${C_0}
+  list [--check] [--json]     站点清单（--check 附带 HTTP 探测）
+  info <域> [--json]          站点详情（含后台密码，仅 root）
+  status [--json]             整机资源与站点规模
+  health [域|--all] [--json]  健康检查（HTTP/缓存命中/证书剩余天数/版本）
+  doctor [--fix]              环境自检（部署前先跑它）
+
+${C_BD}运维${C_0}
+  enable <域>                 允许收录
+  disable <域>                禁止收录（noindex）
+  purge <域>|--all            清理 LSCache
+  ssl <域> [--email E] [--force]   签发/续签证书
+  backup <域>|--all [--type daily|weekly|monthly|manual]
+  restore <域> <备份文件> [--yes]
+  export <域> [-o 文件]       导出可迁移的整站包（库+文件+清单）
+  adopt <包> --domain <新域>  在另一台机器/另一个域名下接管整站
+  upgrade <域>|--all          升级 WP 核心/插件
+  logs [域] [-n N]            查看站点或系统日志
+  remove <域> [--purge]       删除站点（--purge 同时删备份）
+  cron install|remove|status  自动备份计划
+  self-update                 从上游更新工具本身
+  uninstall [--purge]         卸载工具（--purge 连站点一起删）
+
+${C_BD}隔离与守护${C_0}
+  verify [--baseline]         共享核心完整性校验（防单站污染全站）
+  isolate <域> [--core] [--php-pool N] [--undo]
+                              单站隔离：拆硬链接核心 / 独立 PHP 进程池
+  guard install|remove|status|run
+                              巡检守护：定时探测全站，OLS 挂了自动重启
+
+${C_BD}Cloudflare${C_0}
+  cf status [域|--all]        边缘节点 / TTFB / TLS 实测（判断是否绕路）
+  cf probe [--targets a,b]    优选域名延迟实测并排序
+  cf plan <域> [--all]        生成 SaaS 自定义主机名（优选 IP）接入步骤
+
+${C_BD}全局选项${C_0}
+  --dry-run                   只打印计划，不落盘
+  --yes, -y                   跳过确认
+  --json                      机器可读输出
+  --quiet, -q                 静默
+  --verbose, -v               调试输出
+  --no-color                  关闭彩色
+  --config <文件>             指定配置文件
+  --version / --help
+
+${C_BD}退出码${C_0}
+  0 成功  1 一般失败  2 参数错误  3 前置条件不满足  4 已存在
+  5 不存在  6 锁冲突  7 校验失败  8 外部命令失败
+
+${C_BD}示例${C_0}
+  wp-cluster doctor
+  wp-cluster init
+  wp-cluster add shop1.example.com
+  wp-cluster add blog.example.com --mode domain --ssl --index
+  wp-cluster health --all
+  wp-cluster backup --all
+HELP
+}
+
+# =============================================================================
+#  命令：doctor
+# =============================================================================
+cmd_doctor() {
+  local fix=false
+  if [ "${1:-}" = "--fix" ]; then fix=true; fi
+  local fails=0 warns=0
+
+  chk_ok()   { printf '  %s✓%s %-26s %s\n' "$C_G" "$C_0" "$1" "${2:-}"; }
+  chk_warn() { printf '  %s!%s %-26s %s\n' "$C_Y" "$C_0" "$1" "${2:-}"; warns=$((warns + 1)); }
+  chk_fail() { printf '  %s✗%s %-26s %s\n' "$C_R" "$C_0" "$1" "${2:-}"; fails=$((fails + 1)); }
+
+  printf '%s\n' "${C_BD}环境自检${C_0}"
+
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then chk_ok "root 权限"; else chk_fail "root 权限" "请用 sudo 运行"; fi
+
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}:${VERSION_ID:-}" in
+      debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:24.10) chk_ok "操作系统" "${PRETTY_NAME:-$ID}" ;;
+      *) chk_warn "操作系统" "${PRETTY_NAME:-unknown}（仅验证 Debian 12/13、Ubuntu 22.04/24.04）" ;;
+    esac
+  else
+    chk_warn "操作系统" "无法识别 /etc/os-release"
+  fi
+
+  if [ -x "$LSWS_HOME/bin/lshttpd" ]; then
+    chk_ok "OpenLiteSpeed" "$("$LSWS_HOME/bin/lshttpd" -v 2>/dev/null | head -1 | awk '{print $1}')"
+  else
+    chk_fail "OpenLiteSpeed" "未安装：$LSWS_HOME/bin/lshttpd"
+  fi
+
+  if systemctl is-active --quiet lsws 2>/dev/null; then chk_ok "lsws 服务" "active"; else chk_fail "lsws 服务" "未运行"; fi
+
+  if [ -x "$PHP_BIN" ]; then
+    local mods missing=""
+    mods=$("$PHP_BIN" -m 2>/dev/null || true)
+    local m
+    for m in pdo_sqlite sqlite3 apcu mbstring curl; do
+      printf '%s\n' "$mods" | grep -qiE "^${m}$" || missing="$missing $m"
+    done
+    printf '%s\n' "$mods" | grep -qi 'opcache' || missing="$missing opcache"
+    if [ -z "$missing" ]; then chk_ok "LSPHP 扩展" "$("$PHP_BIN" -r 'echo PHP_VERSION;')"
+    else chk_fail "LSPHP 扩展" "缺少:$missing"; fi
+  else
+    chk_fail "LSPHP" "未找到 $PHP_BIN"
+  fi
+
+  if [ -x "$WP_CLI" ] || [ -f "$WP_CLI" ]; then chk_ok "wp-cli" "$("$PHP_BIN" "$WP_CLI" --version --allow-root 2>/dev/null | head -1)"; else chk_fail "wp-cli" "未找到 $WP_CLI"; fi
+
+  if detect_template; then chk_ok "模板站" "$TEMPLATE_SITE"; else chk_fail "模板站" "找不到含 SQLite 插件的站点，请设置 TEMPLATE_SITE"; fi
+
+  if [ -f "$LSWS_CONF" ] && ols_validate; then chk_ok "OLS 配置语法"; else chk_fail "OLS 配置语法" "lshttpd -t 报错"; fi
+
+  local avail_kb
+  avail_kb=$(df -Pk "$WWW_ROOT" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -n "$avail_kb" ] && [ "$avail_kb" -gt 2097152 ]; then chk_ok "磁盘余量" "$(human_size "$avail_kb")"
+  else chk_warn "磁盘余量" "$(human_size "${avail_kb:-0}")，建议 >2G"; fi
+
+  local swap_kb
+  swap_kb=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
+  if [ "$swap_kb" -gt 0 ]; then chk_ok "Swap" "$(human_size "$swap_kb")"; else chk_warn "Swap" "未启用，低内存机型建议开 1G"; fi
+
+  if [ -w "$WWW_ROOT" ] || [ "$fix" = true ]; then chk_ok "站点根目录" "$WWW_ROOT"; else chk_fail "站点根目录" "$WWW_ROOT 不可写"; fi
+
+  if [ -f "$DB_DIR" ] || [ -d "$DB_DIR" ]; then
+    local owner; owner=$(stat -c '%U:%G' "$DB_DIR" 2>/dev/null)
+    if [ "$owner" = "$WEB_USER:$WEB_GROUP" ]; then chk_ok "数据库目录权限" "$owner"
+    elif [ "$fix" = true ]; then
+      if chown -R "$WEB_USER:$WEB_GROUP" "$DB_DIR" && chmod 775 "$DB_DIR"; then
+        chk_ok "数据库目录权限" "已修复为 $WEB_USER:$WEB_GROUP"
+      else
+        chk_fail "数据库目录权限" "修复失败"
+      fi
+    else chk_warn "数据库目录权限" "$owner（应为 $WEB_USER:$WEB_GROUP，可 --fix）"; fi
+  else
+    chk_ok "数据库目录" "尚未创建（init 时创建）"
+  fi
+
+  if have flock && have python3 && have curl && have openssl; then chk_ok "依赖命令" "flock/python3/curl/openssl"; else chk_fail "依赖命令" "缺少 flock/python3/curl/openssl"; fi
+
+  if [ -n "$(find "$STATE_DIR" -maxdepth 1 -type d 2>/dev/null)" ] || [ "$fix" = true ]; then
+    chk_ok "状态目录" "$STATE_DIR"
+  else
+    chk_warn "状态目录" "尚未初始化（init）"
+  fi
+
+  echo
+  if [ "$fails" -gt 0 ]; then
+    err "自检未通过：$fails 项失败，$warns 项警告"
+    return "$E_PRECOND"
+  fi
+  if [ "$warns" -gt 0 ]; then warn "自检通过，$warns 项警告"; else info "自检全部通过"; fi
+}
+
+# =============================================================================
+#  命令：init
+# =============================================================================
+# 移除模板/导出包里遗留的「无条件 noindex」mu-plugin。
+# 这些文件会压过 wp-cluster 的收录开关，导致 enable 之后页面仍然 noindex。
+strip_mu_plugins() {
+  local mudir=$1/mu-plugins name
+  [ -d "$mudir" ] || return 0
+  [ -n "${TEMPLATE_STRIP_MU:-}" ] || return 0
+  while IFS= read -r name; do
+    name=${name//[[:space:]]/}
+    [ -n "$name" ] || continue
+    [ -e "$mudir/$name" ] || continue
+    if $DRY_RUN; then
+      step "[dry-run] 跳过模板 mu-plugin: $name"
+    else
+      rm -f "$mudir/$name" 2>/dev/null || true
+      debug "已移除模板 mu-plugin: $name"
+    fi
+  done <<<"$(printf '%s' "$TEMPLATE_STRIP_MU" | tr ',' '\n')"
+  return 0
+}
+
+MU_PLUGIN_CONTENT='<?php
+/**
+ * Plugin Name: wp-cluster noindex guard
+ * Description: 当 wp-config.php 定义 WP_CLUSTER_NOINDEX 为 true 时，全站输出 noindex,nofollow。
+ * Version: 1.0.0
+ */
+if ( ! defined( "ABSPATH" ) ) { return; }
+if ( ! defined( "WP_CLUSTER_NOINDEX" ) || ! WP_CLUSTER_NOINDEX ) { return; }
+
+add_filter( "wp_robots", function ( $robots ) {
+    unset( $robots["index"], $robots["follow"] );
+    $robots["noindex"]  = true;
+    $robots["nofollow"] = true;
+    return $robots;
+}, 9999 );
+
+add_filter( "rank_math/frontend/robots", function ( $robots ) {
+    if ( ! is_array( $robots ) ) { return $robots; }
+    foreach ( array( "index", "follow", "max-snippet", "max-video-preview", "max-image-preview" ) as $k ) {
+        unset( $robots[ $k ] );
+    }
+    $robots["noindex"]  = "noindex";
+    $robots["nofollow"] = "nofollow";
+    return $robots;
+}, 9999 );
+
+add_action( "send_headers", function () {
+    if ( ! headers_sent() ) {
+        header( "X-Robots-Tag: noindex, nofollow", true );
+    }
+}, 1 );
+'
+
+cmd_init() {
+  need_root init
+  step "初始化 wp-cluster 环境"
+
+  if ! detect_template; then
+    die_code "$E_PRECOND" "找不到可用的模板站（需含 sqlite-database-integration 插件与 db.php）。请在配置中设置 TEMPLATE_SITE"
+  fi
+
+  run mkdir -p "$WWW_ROOT" "$DB_DIR" "$CORE_DIR" \
+    "$STATE_DIR/sites" "$STATE_DIR/mu-plugins" "$BACKUP_DIR" "$LOG_DIR"
+
+  if ! $DRY_RUN; then
+    chown "$WEB_USER:$WEB_GROUP" "$DB_DIR" 2>/dev/null || true
+    chmod 775 "$DB_DIR" 2>/dev/null || true
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null || true
+  fi
+
+  printf '%s' "$MU_PLUGIN_CONTENT" | write_file "$STATE_DIR/mu-plugins/wp-cluster-noindex.php"
+
+  build_core
+
+  # 日志轮转
+  write_file /etc/logrotate.d/wp-cluster <<'LR'
+/var/log/wp-cluster/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LR
+
+  info "初始化完成"
+  printf '  共享核心 : %s\n' "$CORE_DIR"
+  printf '  状态目录 : %s\n' "$STATE_DIR"
+  printf '  备份目录 : %s\n' "$BACKUP_DIR"
+}
+
+# =============================================================================
+#  命令：add
+# =============================================================================
+render_vhost() {
+  local domain=$1 site_dir=$2 mode=$3 ssl=$4 mem=$5
+  local rewrite_block="" vhssl_block=""
+
+  if [ "$mode" = "domain" ] && [ "$ssl" = "1" ]; then
+    rewrite_block=$(cat <<EOF
+
+rewrite  {
+  enable                  1
+  logLevel                0
+  RewriteCond %{SERVER_PORT} 80
+  RewriteRule ^(.*)\$ https://${domain}/\$1 [R=301,L]
+}
+EOF
+)
+    vhssl_block=$(cat <<EOF
+
+vhssl  {
+  keyFile                   ${CERT_DIR}/${domain}/privkey.pem
+  certFile                  ${CERT_DIR}/${domain}/fullchain.pem
+  certChain                 1
+}
+EOF
+)
+  fi
+
+  cat <<EOF
+docRoot                   ${site_dir}
+enableGzip                1
+
+context /.well-known/acme-challenge/ {
+  location                ${site_dir}/.well-known/acme-challenge/
+  allowBrowse             1
+  addDefaultCharset       off
+}
+
+context / {
+  location                \$DOC_ROOT/
+  allowBrowse             1
+  extraHeaders            <<<END_HDR
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+Permissions-Policy: geolocation=(), microphone=(), camera=()
+Content-Security-Policy: object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self' https: http:
+Referrer-Policy: strict-origin-when-cross-origin
+END_HDR
+  rewrite  {
+    RewriteFile           .htaccess
+  }
+  addDefaultCharset       utf-8
+}
+
+index  {
+  indexFiles              index.php, index.html, index.htm
+  autoIndex               0
+  useServer               0
+}
+
+errorlog \$VH_ROOT/logs/error.log {
+  useServer               1
+  logLevel                ERROR
+  rollingSize             10M
+}
+
+accessLog \$VH_ROOT/logs/access.log {
+  useServer               1
+  keepDays                30
+  rollingSize             10M
+}
+
+rewrite  {
+  enable                  1
+  logLevel                0
+}
+${rewrite_block}
+general  {
+  enableContextAC         0
+}
+${vhssl_block}
+EOF
+}
+
+render_wpconfig() {
+  local url=$1 db_path=$2 salt=$3 noindex=$4 mem=$5 domain=$6
+  local salts=""
+  salts=$(cat <<EOF
+define('AUTH_KEY',         '$(rand_hex)');
+define('SECURE_AUTH_KEY',  '$(rand_hex)');
+define('LOGGED_IN_KEY',    '$(rand_hex)');
+define('NONCE_KEY',        '$(rand_hex)');
+define('AUTH_SALT',        '$(rand_hex)');
+define('SECURE_AUTH_SALT', '$(rand_hex)');
+define('LOGGED_IN_SALT',   '$(rand_hex)');
+define('NONCE_SALT',       '$(rand_hex)');
+EOF
+)
+
+  cat <<PHPEOF
+<?php
+/**
+ * wp-cluster 自动生成 — ${domain}
+ * 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+ * 手工修改请同步 wp-cluster info 的显示口径
+ */
+define('DB_NAME', 'wordpress');
+define('DB_USER', 'wordpress');
+define('DB_PASSWORD', '');
+define('DB_HOST', 'localhost');
+define('DB_CHARSET', 'utf8mb4');
+define('DB_COLLATE', '');
+define('DB_ENGINE', 'sqlite');
+define('DB_PATH', '${db_path}');
+
+define('WP_CACHE', true);
+define('WP_CACHE_KEY_SALT', '${salt}:');
+define('WP_HOME', '${url}');
+define('WP_SITEURL', '${url}');
+define('WP_CLUSTER_NOINDEX', ${noindex});
+define('WP_MEMORY_LIMIT', '${mem}');
+define('DISALLOW_FILE_EDIT', true);
+define('AUTOMATIC_UPDATER_DISABLED', true);
+define('WP_DEBUG', false);
+define('WP_DEBUG_LOG', false);
+define('WP_DEBUG_DISPLAY', false);
+
+${salts}
+
+\$table_prefix = 'wp_';
+if ( ! defined('ABSPATH') ) { define('ABSPATH', __DIR__ . '/'); }
+require_once ABSPATH . 'wp-settings.php';
+PHPEOF
+}
+
+cmd_add() {
+  need_root add
+  local domain="" mode="port" port="" allow_index=0 title="" admin_user="admin" admin_email="" php_mem="$DEFAULT_PHP_MEMORY" with_demo=false want_ssl=false
+  MINIMAL=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) mode="${2:-}"; shift 2 ;;
+      --port) port="${2:-}"; shift 2 ;;
+      --index) allow_index=1; shift ;;
+      --title) title="${2:-}"; shift 2 ;;
+      --admin-user) admin_user="${2:-}"; shift 2 ;;
+      --admin-email) admin_email="${2:-}"; shift 2 ;;
+      --php-memory) php_mem="${2:-}"; shift 2 ;;
+      --with-demo) with_demo=true; shift ;;
+      --minimal) MINIMAL=true; shift ;;
+      --ssl) want_ssl=true; shift ;;
+      --no-ssl) want_ssl=false; shift ;;
+      -*) die_code "$E_USAGE" "add 未知参数: $1" ;;
+      *) domain="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster add <domain> [--mode port|domain] [--port N] [--index]"
+  domain=${domain,,}
+  validate_domain "$domain" || die_code "$E_USAGE" "域名格式非法: $domain"
+  case "$mode" in port|domain) ;; *) die_code "$E_USAGE" "--mode 只能是 port 或 domain" ;; esac
+
+  if site_exists "$domain"; then die_code "$E_EXISTS" "站点已在注册表中: $domain"; fi
+  if [ -d "$WWW_ROOT/$domain" ]; then die_code "$E_EXISTS" "站点目录已存在: $WWW_ROOT/$domain"; fi
+  [ -f "$CORE_DIR/wp-load.php" ] || die_code "$E_PRECOND" "尚未初始化，请先执行: wp-cluster init"
+  detect_template || die_code "$E_PRECOND" "找不到模板站"
+
+  local site_dir="$WWW_ROOT/$domain" slug db_path salt site_url vh_dir
+  slug=$(slugify "$domain")
+  db_path="$DB_DIR/${slug}.sqlite"
+  salt="$slug"
+  vh_dir="$VHOST_DIR/$domain"
+  [ -n "$admin_email" ] || admin_email="admin@$domain"
+
+  if [ "$mode" = "port" ]; then
+    if [ -n "$port" ]; then
+      validate_port "$port" || die_code "$E_USAGE" "端口非法: $port"
+      if port_in_use "$port"; then die_code "$E_EXISTS" "端口已被占用: $port"; fi
+    else
+      port=$(next_free_port)
+    fi
+    site_url="http://$(get_public_ip):$port"
+  else
+    site_url="http://$domain"
+  fi
+
+  if $want_ssl && [ "$mode" != "domain" ]; then
+    die_code "$E_USAGE" "--ssl 仅适用于 --mode domain（端口模式无公网 80/443）"
+  fi
+
+  step "创建站点 $domain（$mode 模式）"
+
+  # 1) 目录 + 硬链接核心（登记回滚点，失败自动清理）
+  ADD_ROLLBACK="$site_dir"; ADD_DB="$db_path"; ADD_VH="$vh_dir"
+  run mkdir -p "$site_dir"
+  if $DRY_RUN; then
+    step "[dry-run] 硬链接核心 $CORE_DIR → $site_dir"
+  else
+    cp -al "$CORE_DIR/." "$site_dir/" 2>/dev/null || cp -a "$CORE_DIR/." "$site_dir/"
+  fi
+
+  # 2) 独立 wp-content
+  if $DRY_RUN; then
+    step "[dry-run] 建立独立 wp-content"
+  else
+    rm -rf "$site_dir/wp-content"
+    mkdir -p "$site_dir/wp-content"/{plugins,themes,uploads,mu-plugins,languages,upgrade}
+    mkdir -p "$site_dir/.well-known/acme-challenge"
+    if $HARDLINK_PLUGINS; then
+      cp -al "$TEMPLATE_SITE/wp-content/plugins/." "$site_dir/wp-content/plugins/" 2>/dev/null || \
+        cp -a "$TEMPLATE_SITE/wp-content/plugins/." "$site_dir/wp-content/plugins/"
+      cp -al "$TEMPLATE_SITE/wp-content/themes/." "$site_dir/wp-content/themes/" 2>/dev/null || \
+        cp -a "$TEMPLATE_SITE/wp-content/themes/." "$site_dir/wp-content/themes/"
+    else
+      cp -a "$TEMPLATE_SITE/wp-content/plugins/." "$site_dir/wp-content/plugins/"
+      cp -a "$TEMPLATE_SITE/wp-content/themes/." "$site_dir/wp-content/themes/"
+    fi
+    cp -f "$TEMPLATE_SITE/wp-content/db.php" "$site_dir/wp-content/db.php" 2>/dev/null || true
+    # mu-plugins 始终复制：主题/页面构建器常依赖它们，缺了会 500（体积很小，几 MB 以内）
+    if [ -d "$TEMPLATE_SITE/wp-content/mu-plugins" ]; then
+      cp -al "$TEMPLATE_SITE/wp-content/mu-plugins/." "$site_dir/wp-content/mu-plugins/" 2>/dev/null || \
+        cp -a "$TEMPLATE_SITE/wp-content/mu-plugins/." "$site_dir/wp-content/mu-plugins/" 2>/dev/null || true
+    fi
+    cp -f "$STATE_DIR/mu-plugins/wp-cluster-noindex.php" "$site_dir/wp-content/mu-plugins/" 2>/dev/null || true
+    strip_mu_plugins "$site_dir/wp-content"
+  fi
+
+  # 3) wp-config
+  local noindex_const="false"
+  if [ "$allow_index" -eq 0 ]; then noindex_const="true"; fi
+  render_wpconfig "$site_url" "$db_path" "$salt" "$noindex_const" "$php_mem" "$domain" \
+    | write_file "$site_dir/wp-config.php"
+  step "已生成 wp-config（独立 SQLite、独立缓存盐）"
+
+  # 4) 权限（install 前先给目录，install 后补库文件）
+  ensure_ownership "$site_dir"
+
+  # 5) 安装 WordPress
+  step "安装 WordPress"
+  local admin_pass; admin_pass=$(rand_pass)
+  if $DRY_RUN; then
+    step "[dry-run] wp core install --url=$site_url"
+  else
+    if ! "$PHP_BIN" "$WP_CLI" --path="$site_dir" --allow-root core install \
+      --url="$site_url" --title="${title:-$domain}" \
+      --admin_user="$admin_user" --admin_password="$admin_pass" \
+      --admin_email="$admin_email" --skip-email >>"$LOG_DIR/wp-cli.log" 2>&1; then
+      tail -20 "$LOG_DIR/wp-cli.log" >&2 || true
+      die_code "$E_EXTERNAL" "wp core install 失败（详见 $LOG_DIR/wp-cli.log）"
+    fi
+  fi
+
+  # 6) 关键：wp-cli 以 root 建库，权限 600，Web 用户无法写 → 必须修正
+  ensure_ownership "$site_dir" "$db_path"
+
+  # 7) 插件栈：核心三件 + 模板站已启用的插件（主题可能依赖配套插件，缺了会 500）
+  local acts=() p
+  local tpl_plugins
+  tpl_plugins=$("$PHP_BIN" "$WP_CLI" --path="$TEMPLATE_SITE" --allow-root plugin list --status=active --field=name 2>/dev/null || true)
+  if ! $MINIMAL; then
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      if [ -d "$site_dir/wp-content/plugins/$p" ]; then acts+=("$p"); fi
+    done <<<"$tpl_plugins"
+  fi
+  for p in sqlite-database-integration litespeed-cache apcu-manager; do
+    [ -d "$site_dir/wp-content/plugins/$p" ] || continue
+    case " ${acts[*]:-} " in *" $p "*) ;; *) acts+=("$p") ;; esac
+  done
+  if [ ${#acts[@]} -gt 0 ]; then
+    wp_quiet "$site_dir" plugin activate "${acts[@]}" || warn "部分插件激活失败"
+    step "已激活插件（${#acts[@]} 个）: ${acts[*]}"
+  fi
+
+  # APCu 对象缓存（LSCache 自带对象缓存保持关闭，避免冲突）
+  if [ -d "$site_dir/wp-content/plugins/apcu-manager" ]; then
+    wp_quiet "$site_dir" option update apcm_earlyloading 1 >/dev/null || true
+  fi
+
+  # 8) 激活主题（硬链接主题目录后 WP 不会再装默认主题，必须显式激活）
+  local tpl_theme
+  tpl_theme=$("$PHP_BIN" "$WP_CLI" --path="$TEMPLATE_SITE" --allow-root theme list --status=active --field=name 2>/dev/null | head -1 || true)
+  if [ -z "$tpl_theme" ]; then
+    tpl_theme=$(find "$site_dir/wp-content/themes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 | xargs -r basename)
+  fi
+  if [ -n "$tpl_theme" ]; then
+    wp_quiet "$site_dir" theme activate "$tpl_theme" >/dev/null 2>&1 || warn "主题激活失败: $tpl_theme"
+    step "已激活主题: $tpl_theme"
+  fi
+  # 无活动主题时 WordPress 会返回「200 + 空 body」，必须兜底，否则建出白屏站
+  if ! $DRY_RUN; then
+    local active_theme=""
+    active_theme=$("$PHP_BIN" "$WP_CLI" --path="$site_dir" --allow-root theme list --status=active --field=name 2>/dev/null | head -1 || true)
+    if [ -z "$active_theme" ]; then
+      local cand
+      cand=$(find "$site_dir/wp-content/themes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 | xargs -r basename)
+      if [ -n "$cand" ]; then
+        wp_quiet "$site_dir" theme activate "$cand" >/dev/null 2>&1 || true
+        active_theme=$("$PHP_BIN" "$WP_CLI" --path="$site_dir" --allow-root theme list --status=active --field=name 2>/dev/null | head -1 || true)
+      fi
+    fi
+    if [ -z "$active_theme" ]; then
+      die_code "$E_EXTERNAL" "站点没有可用主题（会渲染成空白页），已回滚。请检查模板站 $TEMPLATE_SITE 的 wp-content/themes"
+    fi
+  fi
+
+  # 9) 伪静态
+  wp_quiet "$site_dir" rewrite structure '/%postname%/' >/dev/null || true
+  wp_quiet "$site_dir" rewrite flush >/dev/null || true
+
+  # 9) 演示内容
+  if $with_demo; then
+    step "生成演示内容"
+    wp_quiet "$site_dir" post generate --count=8 --post_type=post --post_status=publish >/dev/null || true
+    wp_quiet "$site_dir" post generate --count=3 --post_type=page --post_status=publish >/dev/null || true
+  fi
+
+  # 10) vhost
+  local ssl_flag=0
+  if $want_ssl; then ssl_flag=1; fi
+  render_vhost "$domain" "$site_dir" "$mode" "$ssl_flag" "$php_mem" | write_file "$vh_dir/vhconf.conf"
+  run mkdir -p "$site_dir/logs"
+  step "已生成 vhost: $vh_dir/vhconf.conf"
+
+  # 11) OLS 注册（先拍快照，失败可整体回滚）
+  ADD_CONF_BAK="$LSWS_CONF.add-$(date +%s)-$$"
+  if ! $DRY_RUN; then cp -a "$LSWS_CONF" "$ADD_CONF_BAK"; fi
+  if [ "$mode" = "port" ]; then
+    ols_txn "注册站点到 OLS" ols_conf add_test "$domain" "$site_dir" "$vh_dir/vhconf.conf" "$port" \
+      || die_code "$E_VALIDATE" "写入 OLS 配置失败，已回滚"
+  else
+    ols_txn "注册站点到 OLS" ols_conf add_domain "$domain" "$site_dir" "$vh_dir/vhconf.conf" \
+      || die_code "$E_VALIDATE" "写入 OLS 配置失败，已回滚"
+  fi
+
+  ols_restart
+
+  # 12) 写注册表（在 OLS 生效之后，失败不留半成品记录）
+  local idx_flag=0; if [ "$allow_index" -eq 1 ]; then idx_flag=1; fi
+  local wpver="-"
+  $DRY_RUN || wpver=$("$PHP_BIN" "$WP_CLI" --path="$site_dir" --allow-root core version 2>/dev/null || echo "-")
+
+  write_file "$(meta_file "$domain")" <<EOF
+DOMAIN="$domain"
+MODE="$mode"
+PORT="${port:-0}"
+URL="$site_url"
+TITLE="$(shq "${title:-$domain}")"
+ADMIN_USER="$admin_user"
+ADMIN_PASS="$admin_pass"
+ADMIN_EMAIL="$admin_email"
+SITE_DIR="$site_dir"
+DB_PATH="$db_path"
+INDEX="$idx_flag"
+SSL="0"
+PHP_MEMORY="$php_mem"
+WP_VERSION="$wpver"
+CREATED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+EOF
+  if ! $DRY_RUN; then chmod 600 "$(meta_file "$domain")"; fi
+  ADD_ROLLBACK=""; ADD_DB=""; ADD_VH=""
+  if [ -n "${ADD_CONF_BAK:-}" ]; then rm -f "$ADD_CONF_BAK" 2>/dev/null || true; ADD_CONF_BAK=""; fi
+
+  # 13) SSL（域名模式）
+  if $want_ssl; then
+    if ! $DRY_RUN; then
+      if ! cmd_ssl "$domain" --yes >/dev/null 2>&1; then
+        warn "证书签发失败（站点仍可用 HTTP）。稍后可重试: wp-cluster ssl $domain"
+      fi
+    fi
+  fi
+
+  # 14) 验收
+  local code probe_url=""
+  if $DRY_RUN; then
+    info "[dry-run] 建站计划已完成，未改动任何文件"
+    printf '  %s计划地址%s : %s\n' "$C_BD" "$C_0" "$site_url"
+    printf '  %s实际执行%s : 去掉 --dry-run 即可建站\n' "$C_BD" "$C_0"
+    ADD_ROLLBACK=""; ADD_DB=""; ADD_VH=""; ADD_CONF_BAK=""
+    return 0
+  fi
+  if [ "$mode" = "port" ]; then probe_url="http://127.0.0.1:$port/"; else probe_url="http://127.0.0.1/"; fi
+  # 首访建立 LSCache，二次取真实状态
+  if [ "$mode" = "port" ]; then
+    http_code "$probe_url" >/dev/null
+  else
+    curl -s -o /dev/null -H "Host: $domain" --max-time 12 "$probe_url" 2>/dev/null || true
+  fi
+  local check_url="${probe_url}?wpcluster-verify=$RANDOM$RANDOM"
+  if [ "$mode" = "port" ]; then
+    code=$(http_code "$check_url")
+  else
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $domain" --max-time 12 "$check_url" 2>/dev/null || echo 000)
+  fi
+
+  echo
+  if [ "$code" != "200" ]; then
+    warn "站点返回 HTTP $code，日志：$LSWS_HOME/logs/error.log"
+    die_code "$E_EXTERNAL" "建站验收失败，已回滚（可先 wp-cluster doctor 检查环境）"
+  fi
+  # 200 但空 body = 无活动主题，必须拦下
+  local bytes
+  bytes=$(curl -s -o /dev/null -w '%{size_download}' --max-time 12 "$check_url" 2>/dev/null || echo 0)
+  if [ "${bytes:-0}" -lt 500 ]; then
+    warn "首页只返回了 $bytes 字节（疑似空白页，通常是主题未激活）"
+    die_code "$E_EXTERNAL" "建站验收失败：页面内容为空，已回滚"
+  fi
+  info "站点就绪（HTTP 200）"
+  printf '  %s域名%s   : %s\n' "$C_BD" "$C_0" "$domain"
+  printf '  %s地址%s   : %s\n' "$C_BD" "$C_0" "$site_url"
+  printf '  %s后台%s   : %s/wp-admin\n' "$C_BD" "$C_0" "$site_url"
+  printf '  %s账号%s   : %s / %s\n' "$C_BD" "$C_0" "$admin_user" "$admin_pass"
+  printf '  %s目录%s   : %s\n' "$C_BD" "$C_0" "$site_dir"
+  printf '  %s数据库%s : %s\n' "$C_BD" "$C_0" "$db_path"
+  printf '  %s收录%s   : %s\n' "$C_BD" "$C_0" "$([ "$idx_flag" -eq 1 ] && echo '允许' || echo '禁止(noindex)')"
+}
+
+# =============================================================================
+#  命令：list / info / status
+# =============================================================================
+cmd_list() {
+  local check=false
+  while [ $# -gt 0 ]; do
+    case "$1" in --check) check=true; shift ;; *) shift ;; esac
+  done
+
+  local domains; domains=$(all_sites)
+  if [ -z "$domains" ]; then
+    $JSON && printf '[]\n' || warn "尚无站点。先执行 wp-cluster init && wp-cluster add <domain>"
+    return 0
+  fi
+
+  if $JSON; then
+    printf '['
+    local first=1 d
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      [ $first -eq 1 ] || printf ','
+      first=0
+      printf '{"domain":"%s","mode":"%s","port":%s,"url":"%s","index":%s,"ssl":%s,"php_memory":"%s","wp_version":"%s","created_at":"%s"}' \
+        "$(json_escape "$d")" "$(site_get "$d" MODE)" "$(site_get "$d" PORT)" \
+        "$(json_escape "$(site_get "$d" URL)")" "$(site_get "$d" INDEX)" "$(site_get "$d" SSL)" \
+        "$(json_escape "$(site_get "$d" PHP_MEMORY)")" "$(json_escape "$(site_get "$d" WP_VERSION)")" \
+        "$(json_escape "$(site_get "$d" CREATED_AT)")"
+    done <<<"$domains"
+    printf ']\n'
+    return 0
+  fi
+
+  printf '%s\n' "${C_BD}已部署站点（共 $(echo "$domains" | wc -l | tr -d ' ') 个）${C_0}"
+  printf '%-30s %-7s %-6s %-9s %-6s %-9s %s\n' "DOMAIN" "MODE" "PORT" "INDEX" "SSL" "DB" "URL"
+  printf '%.0s─' {1..96}; echo
+
+  local d mode port idx ssl db kb code mark
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    mode=$(site_get "$d" MODE)
+    port=$(site_get "$d" PORT)
+    idx=$(site_get "$d" INDEX)
+    ssl=$(site_get "$d" SSL)
+    db=$(site_get "$d" DB_PATH)
+    kb=0; if [ -f "$db" ]; then kb=$(du -k "$db" 2>/dev/null | awk '{print $1}'); fi
+    code=""; mark=""
+    if $check; then
+      local url; url=$(site_get "$d" URL)
+      code=$(http_code "$url" 8)
+      if [ "$code" = "200" ]; then mark="${C_G}●${C_0}"; else mark="${C_R}●${C_0}"; fi
+    fi
+    printf '%-30s %-7s %-6s %-9s %-6s %-9s %s %s\n' \
+      "$d" "$mode" "$([ "$port" = "0" ] && echo '-' || echo "$port")" \
+      "$([ "$idx" = "1" ] && echo 'index' || echo 'noindex')" \
+      "$([ "$ssl" = "1" ] && echo 'https' || echo '-')" \
+      "$(human_size "$kb")" "$(site_get "$d" URL)" "$mark"
+  done <<<"$domains"
+
+  echo
+  printf '  磁盘 %s · 内存 %s · 负载 %s\n' \
+    "$(du -sh "$WWW_ROOT" 2>/dev/null | awk '{print $1}')" \
+    "$(free -m | awk '/Mem:/{printf "%dM/%dM", $3, $2}')" \
+    "$(awk '{print $1}' /proc/loadavg)"
+}
+
+cmd_info() {
+  local domain="${1:-}"
+  [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster info <domain>"
+  require_site "$domain"
+
+  local url mode port idx ssl db dir wpv created user pass email mem
+  url=$(site_get "$domain" URL); mode=$(site_get "$domain" MODE); port=$(site_get "$domain" PORT)
+  idx=$(site_get "$domain" INDEX); ssl=$(site_get "$domain" SSL); db=$(site_get "$domain" DB_PATH)
+  dir=$(site_get "$domain" SITE_DIR); wpv=$(site_get "$domain" WP_VERSION)
+  created=$(site_get "$domain" CREATED_AT); user=$(site_get "$domain" ADMIN_USER)
+  pass=$(site_get "$domain" ADMIN_PASS); email=$(site_get "$domain" ADMIN_EMAIL)
+  mem=$(site_get "$domain" PHP_MEMORY)
+
+  local code ttfb kb files plugins theme title
+  code=$(http_code "$url" 10)
+  ttfb=$(curl -s -o /dev/null -w '%{time_starttransfer}' --max-time 10 "$url" 2>/dev/null || echo "-")
+  kb=0; if [ -f "$db" ]; then kb=$(du -k "$db" | awk '{print $1}'); fi
+  files=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+  plugins=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root plugin list --status=active --format=count 2>/dev/null || echo "-")
+  theme=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root theme list --status=active --field=name 2>/dev/null | head -1 || echo "-")
+  title=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root option get blogname 2>/dev/null || true)
+  [ -n "$title" ] || title=$(site_get "$domain" TITLE)
+
+  if $JSON; then
+    printf '{"domain":"%s","url":"%s","mode":"%s","port":%s,"http_code":"%s","ttfb":%s,"index":%s,"ssl":%s,"wp_version":"%s","db_size_kb":%s,"disk":"%s","active_plugins":"%s","theme":"%s","title":"%s","created_at":"%s"}\n' \
+      "$(json_escape "$domain")" "$(json_escape "$url")" "$mode" "$port" "$code" "${ttfb:--1}" "$idx" "$ssl" \
+      "$(json_escape "$wpv")" "$kb" "$(json_escape "$files")" "$plugins" "$(json_escape "$theme")" \
+      "$(json_escape "$title")" "$(json_escape "$created")"
+    return 0
+  fi
+
+  printf '%s\n' "${C_BD}站点详情：$domain${C_0}"
+  printf '  %-12s %s\n' "地址" "$url"
+  printf '  %-12s %s\n' "标题" "$title"
+  printf '  %-12s %s\n' "状态" "HTTP $code · TTFB $(fmt_sec "$ttfb")s"
+  printf '  %-12s %s\n' "模式" "$mode $([ "$mode" = port ] && echo "(端口 $port)" || echo "(80/443 共享)")"
+  printf '  %-12s %s\n' "收录" "$([ "$idx" = "1" ] && echo '允许' || echo '禁止 noindex')"
+  printf '  %-12s %s\n' "证书" "$([ "$ssl" = "1" ] && echo 'HTTPS 已启用' || echo '无')"
+  printf '  %-12s %s (%s)\n' "WordPress" "$wpv" "$theme"
+  printf '  %-12s %s 个\n' "活动插件" "$plugins"
+  printf '  %-12s %s\n' "PHP 内存" "$mem"
+  printf '  %-12s %s\n' "目录" "$dir"
+  printf '  %-12s %s（%s）\n' "数据库" "$db" "$(human_size "$kb")"
+  printf '  %-12s %s（独占，另共享核心）\n' "磁盘" "$(human_size "$(site_disk_kb "$dir")")"
+  printf '  %-12s %s\n' "创建时间" "${created:-—}"
+  printf '  %-12s %s / %s（%s）\n' "后台" "$user" "$pass" "$email"
+  printf '\n  后台: %s/wp-admin\n' "$url"
+}
+
+cmd_status() {
+  local sites; sites=$(site_count)
+  local mem_total mem_used swap_total swap_used load ols_proc ols_rss php_workers www_kb backup_kb db_kb
+  mem_total=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  mem_used=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{print t-a}' /proc/meminfo)
+  swap_total=$(awk '/SwapTotal/{print $2}' /proc/meminfo)
+  swap_used=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{print t-f}' /proc/meminfo)
+  load=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
+  ols_proc=$(ps -eo args | grep -cE '[l]shttpd|[l]itespeed' || true)
+  ols_rss=$(ps -eo rss,args | grep -E '[l]shttpd|[l]itespeed' | awk '{s+=$1} END{printf "%d", s/1024}')
+  php_workers=$(ps -eo args | grep -c '[l]sphp' || true)
+  www_kb=$(du -sk "$WWW_ROOT" 2>/dev/null | awk '{print $1}')
+  backup_kb=$(du -sk "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+  db_kb=$(du -sk "$DB_DIR" 2>/dev/null | awk '{print $1}')
+
+  if $JSON; then
+    printf '{"sites":%s,"mem_total_kb":%s,"mem_used_kb":%s,"swap_total_kb":%s,"swap_used_kb":%s,"load":"%s","ols_procs":%s,"ols_rss_mb":%s,"php_workers":%s,"www_kb":%s,"db_kb":%s,"backup_kb":%s}\n' \
+      "$sites" "$mem_total" "$mem_used" "$swap_total" "$swap_used" "$load" "$ols_proc" "${ols_rss:-0}" "$php_workers" "${www_kb:-0}" "${db_kb:-0}" "${backup_kb:-0}"
+    return 0
+  fi
+
+  printf '%s\n' "${C_BD}整机资源${C_0}"
+  printf '  %-14s %s / %s\n' "内存" "$(human_size "$mem_used")" "$(human_size "$mem_total")"
+  printf '  %-14s %s / %s\n' "Swap" "$(human_size "$swap_used")" "$(human_size "$swap_total")"
+  printf '  %-14s %s\n' "负载" "$load"
+  printf '  %-14s %s 进程 / %sMB RSS\n' "OpenLiteSpeed" "$ols_proc" "${ols_rss:-0}"
+  printf '  %-14s %s 进程（按需拉起）\n' "LSPHP" "$php_workers"
+  echo
+  printf '%s\n' "${C_BD}站群规模${C_0}"
+  printf '  %-14s %s 个\n' "站点" "$sites"
+  printf '  %-14s %s（共享核心 %s）\n' "站点目录" "$(human_size "${www_kb:-0}")" "$(du -sh "$CORE_DIR" 2>/dev/null | awk '{print $1}')"
+  printf '  %-14s %s\n' "SQLite 库" "$(human_size "${db_kb:-0}")"
+  printf '  %-14s %s\n' "备份" "$(human_size "${backup_kb:-0}")"
+  printf '  %-14s %s\n' "磁盘" "$(df -h "$WWW_ROOT" | awk 'NR==2{print $3"/"$2" ("$5")"}')"
+}
+
+# =============================================================================
+#  命令：health
+# =============================================================================
+cmd_health() {
+  local target="${1:-}" domains
+  case "$target" in
+    --all|"") domains=$(all_sites) ;;
+    *) require_site "$target"; domains="$target" ;;
+  esac
+  [ -n "$domains" ] || { warn "无站点可检查"; return 0; }
+
+  local unhealthy=0 d url code ttfb cache ssl_days wpv bytes
+  local -a rows=()
+
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    url=$(site_get "$d" URL)
+    code=$(http_code "$url" 12)
+    bytes=$(curl -s -o /dev/null -w '%{size_download}' --max-time 12 "$url" 2>/dev/null || echo 0)
+    case "${bytes:-0}" in ''|*[!0-9]*) bytes=0 ;; esac
+    ttfb=$(curl -s -o /dev/null -w '%{time_starttransfer}' --max-time 12 "$url" 2>/dev/null || echo 0)
+    cache=$(curl -sI --max-time 12 "$url" 2>/dev/null | grep -i '^x-litespeed-cache:' | tr -d '\r' | awk '{print $2}' | head -1)
+    wpv=$("$PHP_BIN" "$WP_CLI" --path="$(site_get "$d" SITE_DIR)" --allow-root core version 2>/dev/null || echo "-")
+    ssl_days="-"
+    if [ "$(site_get "$d" SSL)" = "1" ]; then
+      ssl_days=$(echo | openssl s_client -servername "$d" -connect "$d:443" 2>/dev/null \
+        | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 \
+        | xargs -r -I{} date -d {} +%s 2>/dev/null | awk -v now="$(date +%s)" '{printf "%d", ($1-now)/86400}')
+      if [ -z "$ssl_days" ]; then ssl_days="-"; fi
+    fi
+    local status="ok"
+    [ "$code" = "200" ] || { status="fail"; unhealthy=$((unhealthy + 1)); }
+    # 200 + 空 body（典型：无活动主题）= 实际不可用
+    if [ "$code" = "200" ] && [ "$bytes" -lt 500 ]; then
+      status="fail"; unhealthy=$((unhealthy + 1))
+    fi
+    if [ "$ssl_days" != "-" ] && [ "$ssl_days" -lt 14 ] 2>/dev/null; then status="warn"; fi
+    if [ "${cache:-}" = "" ] || [ "${cache:-none}" = "miss" ]; then
+      if [ "$status" = "ok" ]; then status="warn"; fi
+    fi
+    rows+=("$d|$code|$ttfb|${cache:--}|$ssl_days|$wpv|$status|$bytes")
+  done <<<"$domains"
+
+  if $JSON; then
+    printf '['
+    local first=1 r IFS_OLD=$IFS
+    for r in "${rows[@]}"; do
+      IFS='|' read -r d code ttfb cache ssl_days wpv status bytes <<<"$r"
+      [ $first -eq 1 ] || printf ','
+      first=0
+      printf '{"domain":"%s","http_code":"%s","bytes":%s,"ttfb":%s,"cache":"%s","ssl_days":"%s","wp_version":"%s","status":"%s"}' \
+        "$(json_escape "$d")" "$code" "${bytes:-0}" "$(fmt_sec "${ttfb:-0}")" "$(json_escape "$cache")" "$ssl_days" "$(json_escape "$wpv")" "$status"
+    done
+    printf ']\n'
+    IFS=$IFS_OLD
+    [ "$unhealthy" -eq 0 ] || return "$E_FAIL"
+    return 0
+  fi
+
+  printf '%s\n' "${C_BD}健康检查${C_0}"
+  printf '%-30s %-5s %-8s %-9s %-7s %-8s %s\n' "域名" "HTTP" "响应" "TTFB" "缓存" "证书(天)" "状态"
+  printf '%.0s─' {1..96}; echo
+  local r
+  for r in "${rows[@]}"; do
+    IFS='|' read -r d code ttfb cache ssl_days wpv status bytes <<<"$r"
+    local icon
+    case "$status" in
+      ok) icon="${C_G}● ok${C_0}" ;;
+      warn) icon="${C_Y}● warn${C_0}" ;;
+      *) icon="${C_R}● FAIL${C_0}" ;;
+    esac
+    printf '%-30s %-5s %-8s %-9s %-7s %-8s %s\n' "$d" "$code" "$(human_size "$((bytes / 1024))")" "$(fmt_sec "$ttfb")s" "$cache" "$ssl_days" "$icon"
+  done
+  echo
+  if [ "$unhealthy" -gt 0 ]; then
+    err "$unhealthy 个站点异常"
+    return "$E_FAIL"
+  fi
+  info "全部站点正常"
+}
+
+# =============================================================================
+#  命令：enable / disable / purge
+# =============================================================================
+cmd_set_index() {
+  local domain=$1 want=$2
+  require_site "$domain"
+  local dir; dir=$(site_get "$domain" SITE_DIR)
+  if [ "$want" = "1" ]; then
+    wp_quiet "$dir" config delete WP_CLUSTER_NOINDEX >/dev/null 2>&1 || true
+    wp_quiet "$dir" option update blog_public 1 >/dev/null 2>&1 || true
+    step "已允许收录: $domain"
+  else
+    wp_quiet "$dir" config set WP_CLUSTER_NOINDEX true --raw --type=constant >/dev/null 2>&1 || true
+    wp_quiet "$dir" option update blog_public 0 >/dev/null 2>&1 || true
+    step "已禁止收录: $domain"
+  fi
+  site_set "$domain" INDEX "$want"
+  wp_quiet "$dir" litespeed-purge all >/dev/null 2>&1 || true
+  if $DRY_RUN; then return 0; fi
+  local meta
+  meta=$(curl -s --max-time 12 "$(site_get "$domain" URL)/" 2>/dev/null | grep -oiE '<meta[^>]*robots[^>]*>' | head -1)
+  if [ -n "$meta" ]; then printf '  当前 meta: %s\n' "$meta"; fi
+  if [ "$want" = "1" ] && [ -n "$meta" ] && printf '%s' "$meta" | grep -qi 'noindex'; then
+    warn "已放开收录，但页面仍在输出 noindex（有其它插件在写 robots）"
+    local hits
+    hits=$(grep -rl --include='*.php' -e 'wp_robots' -e 'rank_math/frontend/robots' \
+      "$dir/wp-content/mu-plugins" "$dir/wp-content/plugins" 2>/dev/null | xargs -r -n1 basename | sort -u | paste -sd, -)
+    [ -n "$hits" ] && printf '  可疑来源: %s\n' "$hits"
+    printf '  处理办法: 删除可疑的 mu-plugin，或把它写进配置 TEMPLATE_STRIP_MU（建站时自动跳过）\n'
+  fi
+  return 0
+}
+
+cmd_purge() {
+  local target="${1:-}"
+  if [ "$target" = "--all" ] || [ -z "$target" ]; then
+    local d
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      wp_quiet "$(site_get "$d" SITE_DIR)" litespeed-purge all >/dev/null 2>&1 \
+        && printf '  %s ✓\n' "$d" || printf '  %s ✗\n' "$d"
+    done <<<"$(all_sites)"
+    return 0
+  fi
+  require_site "$target"
+  wp_quiet "$(site_get "$target" SITE_DIR)" litespeed-purge all >/dev/null 2>&1 || true
+  info "已清理缓存: $target"
+}
+
+# =============================================================================
+#  命令：ssl
+# =============================================================================
+cmd_ssl() {
+  local domain="${1:-}" email="" force=false
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --email) email="${2:-}"; shift 2 ;;
+      --force) force=true; shift ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster ssl <domain> --email <邮箱> [--force]"
+  require_site "$domain"
+  [ "$(site_get "$domain" MODE)" = "domain" ] || die_code "$E_USAGE" "仅域名模式可签发证书（端口模式没有公网 80/443）"
+
+  local dir url; dir=$(site_get "$domain" SITE_DIR); url=$(site_get "$domain" URL)
+
+  if ! $force; then
+    local ip resolved
+    ip=$(get_public_ip)
+    resolved=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+    if [ -z "$resolved" ]; then
+      die_code "$E_PRECOND" "$domain 没有 A 记录。请先解析到 $ip，或加 --force 跳过检查"
+    fi
+    if [ "$resolved" != "$ip" ]; then
+      die_code "$E_PRECOND" "$domain 解析到 $resolved，与本机 $ip 不一致（CDN 代理时可加 --force）"
+    fi
+  fi
+
+  if ! [ -x "$HOME/.acme.sh/acme.sh" ]; then
+    step "安装 acme.sh"
+    if ! $DRY_RUN; then
+      curl -fsSL https://get.acme.sh | sh -s email="${email:-admin@$domain}" >>"$LOG_DIR/acme.log" 2>&1 \
+        || die_code "$E_EXTERNAL" "acme.sh 安装失败（详见 $LOG_DIR/acme.log）"
+    fi
+  fi
+  local acme="$HOME/.acme.sh/acme.sh"
+
+  # HTTP-01 预检：先确保挑战路径真的可访问，避免触发 Let's Encrypt 频率限制
+  local token="wpcluster-probe-$RANDOM$RANDOM"
+  if ! $DRY_RUN; then
+    mkdir -p "$dir/.well-known/acme-challenge"
+    printf '%s' "$token" >"$dir/.well-known/acme-challenge/$token"
+    chown -R "$WEB_USER:$WEB_GROUP" "$dir/.well-known"
+    local got
+    got=$(curl -s --max-time 10 -H "Host: $domain" "http://127.0.0.1/.well-known/acme-challenge/$token" 2>/dev/null || true)
+    rm -f "$dir/.well-known/acme-challenge/$token"
+    if [ "$got" != "$token" ]; then
+      die_code "$E_VALIDATE" "HTTP-01 预检失败：挑战文件不可访问。请确认 $domain 的 80 端口已映射到本站点（站点需 --mode domain）"
+    fi
+    step "HTTP-01 预检通过"
+  fi
+
+  step "申请证书"
+  run "$acme" --issue -d "$domain" -w "$dir" --keylength ec-256 --force 2>>"$LOG_DIR/acme.log" || {
+    die_code "$E_EXTERNAL" "证书申请失败（详见 $LOG_DIR/acme.log）"
+  }
+
+  run mkdir -p "$CERT_DIR/$domain"
+  run "$acme" --install-cert -d "$domain" --ecc \
+    --key-file "$CERT_DIR/$domain/privkey.pem" \
+    --fullchain-file "$CERT_DIR/$domain/fullchain.pem" \
+    --reloadcmd "systemctl restart lsws" 2>>"$LOG_DIR/acme.log" || true
+
+  if ! $DRY_RUN; then
+    chmod 600 "$CERT_DIR/$domain/privkey.pem" 2>/dev/null || true
+    # vhost 加 vhssl + 80→443 跳转
+    local vh="$VHOST_DIR/$domain/vhconf.conf"
+    if ! grep -q '^vhssl' "$vh"; then
+      cat >>"$vh" <<EOF
+
+vhssl  {
+  keyFile                   $CERT_DIR/$domain/privkey.pem
+  certFile                  $CERT_DIR/$domain/fullchain.pem
+  certChain                 1
+}
+EOF
+    fi
+    if ! grep -q 'RewriteCond %{SERVER_PORT} 80' "$vh"; then
+      python3 - "$vh" "$domain" <<'PY'
+import sys
+f, d = sys.argv[1], sys.argv[2]
+s = open(f, encoding='utf-8').read()
+s = s.replace("rewrite  {\n  enable                  1\n  logLevel                0\n}",
+              "rewrite  {\n  enable                  1\n  logLevel                0\n"
+              f"  RewriteCond %{{SERVER_PORT}} 80\n  RewriteRule ^(.*)$ https://{d}/$1 [R=301,L]\n}}")
+open(f, 'w', encoding='utf-8').write(s)
+PY
+    fi
+    ols_validate || die_code "$E_VALIDATE" "vhost 校验失败"
+    systemctl restart lsws
+    tcp_wait 443 30 || warn "443 未监听"
+
+    url="https://$domain"
+    wp_quiet "$dir" option update home "$url" >/dev/null 2>&1 || true
+    wp_quiet "$dir" option update siteurl "$url" >/dev/null 2>&1 || true
+    wp_quiet "$dir" config set FORCE_SSL_ADMIN true --raw --type=constant >/dev/null 2>&1 || true
+    wp_quiet "$dir" litespeed-purge all >/dev/null 2>&1 || true
+
+    site_set "$domain" SSL 1
+    site_set "$domain" URL "$url"
+  fi
+
+  info "证书就绪: $domain（自动续期由 acme.sh cron 负责）"
+}
+
+# =============================================================================
+#  命令：backup / restore
+# =============================================================================
+snapshot_db() {
+  local src=$1 dst=$2
+  if "$PHP_BIN" -r '
+    $src=$argv[1]; $dst=$argv[2];
+    $db=new PDO("sqlite:".$src);
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $db->exec("VACUUM INTO ".$db->quote($dst));
+  ' "$src" "$dst" 2>/dev/null && [ -s "$dst" ]; then
+    return 0
+  fi
+  cp -f "$src" "$dst"
+}
+
+# SQLite 完整性检查（quick_check）
+sqlite_ok() {
+  "$PHP_BIN" -r '
+    $db=new PDO("sqlite:".$argv[1]);
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $r=$db->query("PRAGMA quick_check")->fetchColumn();
+    exit(trim((string)$r)==="ok" ? 0 : 1);
+  ' "$1" >/dev/null 2>&1
+}
+
+# 原子替换数据库：先写临时文件再 rename。
+# 两个坑：
+#   1) 不能 cp 直接覆盖：在线库被原地截断重写，残留 journal 会把内容滚回旧库；
+#   2) OLS restart 会强杀正在写库的 PHP 子进程，留下 hot journal，下次打开即回滚损坏。
+# 因此替换前后都要清掉 -journal/-wal/-shm。
+replace_db() {
+  local src=$1 dst=$2 tmp="${2}.incoming.$$"
+  rm -f "${dst}-journal" "${dst}-wal" "${dst}-shm" 2>/dev/null || true
+  cp -f "$src" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  chmod 664 "$tmp" 2>/dev/null || true
+  chown "$WEB_USER:$WEB_GROUP" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  rm -f "${dst}-journal" "${dst}-wal" "${dst}-shm" 2>/dev/null || true
+  return 0
+}
+
+cmd_backup() {
+  local target="" type="daily"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) target="--all"; shift ;;
+      --type) type="${2:-daily}"; shift 2 ;;
+      -*) die_code "$E_USAGE" "backup 未知参数: $1" ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+  case "$type" in daily|weekly|monthly|manual) ;; *) die_code "$E_USAGE" "--type 只能是 daily/weekly/monthly/manual" ;; esac
+
+  local domains
+  if [ "$target" = "--all" ] || [ -z "$target" ]; then domains=$(all_sites); else require_site "$target"; domains="$target"; fi
+  [ -n "$domains" ] || { warn "无站点可备份"; return 0; }
+
+  local d ok=0 fail=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    if backup_one "$d" "$type"; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
+  done <<<"$domains"
+
+  [ "$fail" -eq 0 ] || die_code "$E_FAIL" "备份完成：成功 $ok，失败 $fail"
+  info "备份完成：$ok 个站点（类型 $type）"
+}
+
+backup_one() {
+  local domain=$1 type=$2
+  local dir db url out stage ts
+  dir=$(site_get "$domain" SITE_DIR); db=$(site_get "$domain" DB_PATH)
+  url=$(site_get "$domain" URL)
+  ts=$(date +%Y%m%d-%H%M%S)
+  out="$BACKUP_DIR/$domain"
+  stage=$(mktemp -d)
+
+  if $DRY_RUN; then
+    step "[dry-run] 备份 $domain → $out/${domain}-${type}-${ts}.tar.gz"
+    rmdir "$stage" 2>/dev/null || true
+    return 0
+  fi
+
+  mkdir -p "$out"
+  snapshot_db "$db" "$stage/database.sqlite" 2>/dev/null || cp -f "$db" "$stage/database.sqlite"
+  tar czf "$stage/site-files.tar.gz" -C "$dir" \
+    --exclude='wp-content/cache' --exclude='wp-content/litespeed' \
+    --exclude='wp-content/upgrade' --exclude='wp-content/ai1wm-backups' \
+    --exclude='*.log' wp-config.php wp-content 2>/dev/null || {
+      rm -rf "$stage"; err "$domain 文件打包失败"; return 1; }
+
+  local wpv
+  wpv=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root core version 2>/dev/null || echo "-")
+  cat >"$stage/manifest.txt" <<EOF
+domain=$domain
+url=$url
+wp_version=$wpv
+php_version=$("$PHP_BIN" -r 'echo PHP_VERSION;')
+created_at=$(date '+%Y-%m-%d %H:%M:%S')
+type=$type
+host=$(hostname)
+cluster_version=$WP_CLUSTER_VERSION
+EOF
+  ( cd "$stage" && sha256sum database.sqlite site-files.tar.gz >SHA256SUMS )
+
+  local file="$out/${domain}-${type}-${ts}.tar.gz"
+  tar czf "$file" -C "$stage" database.sqlite site-files.tar.gz manifest.txt SHA256SUMS
+
+  # 完整性校验
+  if ! gzip -t "$file" 2>/dev/null; then
+    rm -f "$file"; rm -rf "$stage"; err "$domain 备份文件损坏"; return 1
+  fi
+  rm -rf "$stage"
+
+  prune_backups "$domain" "$type"
+  printf '  %s ✓ %s (%s)\n' "$domain" "$(basename "$file")" "$(du -h "$file" | awk '{print $1}')"
+  _log_line INFO "backup $domain type=$type file=$file"
+  return 0
+}
+
+prune_backups() {
+  local domain=$1 type=$2 keep=0
+  case "$type" in
+    daily) keep=$BACKUP_DAILY_KEEP ;;
+    weekly) keep=$BACKUP_WEEKLY_KEEP ;;
+    monthly) keep=$BACKUP_MONTHLY_KEEP ;;
+    *) keep=10 ;;
+  esac
+  [ "$keep" -gt 0 ] || return 0
+  ls -1t "$BACKUP_DIR/$domain/${domain}-${type}-"*.tar.gz 2>/dev/null \
+    | tail -n +"$((keep + 1))" | while IFS= read -r old; do rm -f "$old"; done
+  return 0
+}
+
+cmd_restore() {
+  local domain="${1:-}" file="${2:-}"
+  [ -n "$domain" ] && [ -n "$file" ] || die_code "$E_USAGE" "用法: wp-cluster restore <domain> <备份文件> [--yes]"
+  require_site "$domain"
+  [ -f "$file" ] || die_code "$E_NOENT" "备份文件不存在: $file"
+
+  local dir db stage
+  dir=$(site_get "$domain" SITE_DIR); db=$(site_get "$domain" DB_PATH)
+  stage=$(mktemp -d)
+
+  if $DRY_RUN; then
+    step "[dry-run] 从 $file 恢复 $domain"
+    rmdir "$stage" 2>/dev/null || true
+    return 0
+  fi
+
+  tar xzf "$file" -C "$stage" || { rm -rf "$stage"; die_code "$E_VALIDATE" "备份文件解包失败"; }
+  ( cd "$stage" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
+    || { rm -rf "$stage"; die_code "$E_VALIDATE" "校验和不匹配，备份可能损坏"; }
+
+  # 路径穿越防护
+  if tar tzf "$stage/site-files.tar.gz" 2>/dev/null | grep -qE '\.\./|^/'; then
+    rm -rf "$stage"; die_code "$E_VALIDATE" "备份包含非法路径，已拒绝"
+  fi
+
+  confirm_typed "将用备份覆盖 $domain 的数据库与文件" "$domain" || { rm -rf "$stage"; info "已取消"; return 0; }
+
+  local safety="$BACKUP_DIR/$domain/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+  mkdir -p "$BACKUP_DIR/$domain"
+  backup_one "$domain" "manual" >/dev/null 2>&1 || warn "恢复前快照失败，仍继续（原备份仍保留）"
+
+  step "恢复数据库"
+  replace_db "$stage/database.sqlite" "$db" || { rm -rf "$stage"; die_code "$E_EXTERNAL" "数据库写入失败，已保留原库"; }
+  if ! sqlite_ok "$db"; then
+    rm -rf "$stage"
+    die_code "$E_VALIDATE" "备份数据库未通过完整性检查（PRAGMA quick_check）"
+  fi
+
+  step "恢复文件"
+  local old="$dir.restore-old.$(date +%s)"
+  mv "$dir/wp-content" "$old-wp-content" 2>/dev/null || true
+  tar xzf "$stage/site-files.tar.gz" -C "$dir" || {
+    warn "文件恢复失败，正在回滚"
+    if [ -d "$old-wp-content" ]; then
+      rm -rf "$dir/wp-content"
+      mv "$old-wp-content" "$dir/wp-content"
+    fi
+    rm -rf "$stage"
+    die_code "$E_EXTERNAL" "文件恢复失败，已回滚"
+  }
+  rm -rf "$old-wp-content"
+
+  ensure_ownership "$dir" "$db"
+  wp_quiet "$dir" litespeed-purge all >/dev/null 2>&1 || true
+  rm -rf "$stage"
+
+  local code; code=$(http_code "$(site_get "$domain" URL)")
+  info "恢复完成（HTTP $code）"
+  [ -f "$safety" ] || true
+}
+
+# =============================================================================
+#  命令：upgrade
+# =============================================================================
+cmd_upgrade() {
+  local target="${1:-}"
+  local domains
+  if [ "$target" = "--all" ] || [ -z "$target" ]; then domains=$(all_sites); else require_site "$target"; domains="$target"; fi
+  [ -n "$domains" ] || { warn "无站点"; return 0; }
+
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    local dir; dir=$(site_get "$d" SITE_DIR)
+    step "升级 $d"
+    wp_quiet "$dir" core update --minor >/dev/null 2>&1 || warn "$d 核心升级失败"
+    wp_quiet "$dir" plugin update --all >/dev/null 2>&1 || warn "$d 插件升级失败"
+    wp_quiet "$dir" core update-db >/dev/null 2>&1 || true
+    wp_quiet "$dir" litespeed-purge all >/dev/null 2>&1 || true
+    local v; v=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root core version 2>/dev/null || echo "-")
+    site_set "$d" WP_VERSION "$v"
+    printf '  %s → %s\n' "$d" "$v"
+  done <<<"$domains"
+  info "升级完成"
+}
+
+# =============================================================================
+#  命令：logs
+# =============================================================================
+cmd_logs() {
+  local target="" n=50
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) n="${2:-50}"; shift 2 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+  if [ -n "$target" ]; then
+    require_site "$target"
+    local f
+    f="$(site_get "$target" SITE_DIR)/logs/error.log"
+    [ -f "$f" ] || f="$LSWS_HOME/logs/error.log"
+    printf '%s\n' "${C_BD}$target 日志（$f）${C_0}"
+    tail -n "$n" "$f" 2>/dev/null || warn "无 error.log"
+  else
+    printf '%s\n' "${C_BD}wp-cluster 日志${C_0}"
+    tail -n "$n" "$LOG_FILE" 2>/dev/null || warn "无日志"
+  fi
+}
+
+# =============================================================================
+#  命令：remove / import / cron / self-update / uninstall
+# =============================================================================
+cmd_remove() {
+  need_root remove
+  local domain="${1:-}" purge=false
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in --purge) purge=true; shift ;; *) shift ;; esac
+  done
+  [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster remove <domain> [--purge]"
+  require_site "$domain"
+
+  local dir db url
+  dir=$(site_get "$domain" SITE_DIR); db=$(site_get "$domain" DB_PATH); url=$(site_get "$domain" URL)
+
+  printf '%s\n' "${C_R}即将删除站点${C_0} $domain"
+  printf '  目录 %s\n  数据库 %s\n' "$dir" "$db"
+  if $purge; then printf '  备份 %s（--purge 会一并删除）\n' "$BACKUP_DIR/$domain"; fi
+  confirm_typed "此操作不可恢复" "$domain" || { info "已取消"; return 0; }
+
+  ols_txn "从 OLS 移除站点" ols_conf remove "$domain" || warn "OLS 配置清理异常，请人工检查"
+
+  # 若该站做过 isolate --php-pool，独立 extProcessor 必须一并删除，
+  # 否则会残留在 OLS 配置里（占 socket、让后续同名站点误判「已隔离」）
+  local rm_slug rm_pool
+  rm_slug=$(slugify "$domain")
+  rm_pool="lsphp_${rm_slug}"
+  if ext_conf has "$rm_pool"; then
+    if $DRY_RUN; then
+      step "[dry-run] 移除独立 PHP 池 $rm_pool"
+    else
+      ols_txn "移除站点独立 PHP 池" ext_conf remove "$rm_pool" \
+        || warn "PHP 池清理失败，请检查 extProcessor $rm_pool"
+    fi
+  fi
+  rm -f "/tmp/lshttpd/${rm_slug}.sock" "/tmp/lshttpd/${rm_pool}.sock" 2>/dev/null || true
+
+  ols_restart || warn "OLS 重启失败"
+
+  run rm -rf "$dir" "$VHOST_DIR/$domain" "$db"
+  if $purge; then run rm -rf "$BACKUP_DIR/$domain"; fi
+  run rm -f "$(meta_file "$domain")"
+
+  info "已删除 $domain"
+}
+
+cmd_import() {
+  need_root import
+  local domain="" all=false
+  while [ $# -gt 0 ]; do
+    case "$1" in --all) all=true; shift ;; *) domain="$1"; shift ;; esac
+  done
+
+  local list=()
+  if $all; then
+    local d
+    for d in "$WWW_ROOT"/*/; do
+      d=${d%/}; d=$(basename "$d")
+      if [ "$d" = "wp-core" ]; then continue; fi
+      if [ "$d" = "db" ]; then continue; fi
+      if [ -f "$WWW_ROOT/$d/wp-config.php" ]; then list+=("$d"); fi
+    done
+  else
+    [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster import --all | import <domain>"
+    list+=("$domain")
+  fi
+
+  local d imported=0
+  for d in "${list[@]}"; do
+    [ -f "$WWW_ROOT/$d/wp-config.php" ] || { warn "跳过 $d（无 wp-config.php）"; continue; }
+    if site_exists "$d"; then debug "$d 已在注册表"; continue; fi
+
+    local dir="$WWW_ROOT/$d" url port mode db idx ssl wpv
+    url=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root option get home 2>/dev/null || echo "")
+    [ -n "$url" ] || url="http://$d"
+    port=$(ols_conf list 2>/dev/null | awk -F'\t' -v d="$d" '$1==d{print $2; exit}' || true)
+    mode="port"
+    if [ -z "$port" ]; then mode="domain"; port=0; fi
+    if [ "$port" = "80" ] || [ "$port" = "443" ]; then mode="domain"; fi
+    db=$(awk -F"'" '/DB_PATH/{print $4; exit}' "$dir/wp-config.php" 2>/dev/null)
+    idx=1
+    grep -q "WP_CLUSTER_NOINDEX', true" "$dir/wp-config.php" 2>/dev/null && idx=0
+    grep -q "X-Robots-Tag" "$VHOST_DIR/$d/vhconf.conf" 2>/dev/null && idx=0
+    ssl=0; grep -q '^vhssl' "$VHOST_DIR/$d/vhconf.conf" 2>/dev/null && ssl=1
+    wpv=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root core version 2>/dev/null || echo "-")
+
+    write_file "$(meta_file "$d")" <<EOF
+DOMAIN="$d"
+MODE="$mode"
+PORT="${port:-0}"
+URL="$url"
+TITLE="$d"
+ADMIN_USER="admin"
+ADMIN_PASS="(imported)"
+ADMIN_EMAIL="admin@$d"
+SITE_DIR="$dir"
+DB_PATH="$db"
+INDEX="$idx"
+SSL="$ssl"
+PHP_MEMORY="$DEFAULT_PHP_MEMORY"
+WP_VERSION="$wpv"
+CREATED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
+EOF
+    $DRY_RUN || chmod 600 "$(meta_file "$d")"
+    printf '  %s 已接管（%s 模式，端口 %s）\n' "$d" "$mode" "$port"
+    imported=$((imported + 1))
+  done
+  info "接管完成：$imported 个站点"
+}
+
+cmd_cron() {
+  local action="${1:-status}" f=/etc/cron.d/wp-cluster
+  case "$action" in
+    install)
+      need_root cron
+      write_file "$f" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+30 3 * * * root /usr/local/bin/wp-cluster backup --all --type daily >>$LOG_DIR/cron.log 2>&1
+15 4 * * 0 root /usr/local/bin/wp-cluster backup --all --type weekly >>$LOG_DIR/cron.log 2>&1
+45 4 1 * * root /usr/local/bin/wp-cluster backup --all --type monthly >>$LOG_DIR/cron.log 2>&1
+EOF
+      $DRY_RUN || chmod 644 "$f"
+      info "已安装自动备份计划（每日 03:30 / 每周日 04:15 / 每月 1 日 04:45）"
+      ;;
+    remove)
+      need_root cron
+      run rm -f "$f"
+      info "已移除自动备份计划"
+      ;;
+    status)
+      if [ -f "$f" ]; then printf '%s\n' "${C_BD}自动备份计划${C_0}"; cat "$f"; else warn "未安装（wp-cluster cron install）"; fi
+      ;;
+    *) die_code "$E_USAGE" "用法: wp-cluster cron install|remove|status" ;;
+  esac
+}
+
+# 解析自更新地址：环境变量 > 配置 > 标记文件 > 内置默认
+resolve_update_url() {
+  if [ -n "${WP_CLUSTER_UPDATE_URL:-}" ]; then
+    printf '%s' "$WP_CLUSTER_UPDATE_URL"; return 0
+  fi
+  if [ -n "${SELF_UPDATE_URL:-}" ]; then
+    printf '%s' "$SELF_UPDATE_URL"; return 0
+  fi
+  local f url
+  for f in "${UPDATE_URL_MARKERS[@]}"; do
+    [ -n "$f" ] || continue
+    [ -r "$f" ] || continue
+    url=$(head -1 "$f" 2>/dev/null | tr -d '\r\n' | sed 's/[[:space:]]*$//')
+    if [ -n "$url" ]; then printf '%s' "$url"; return 0; fi
+  done
+  printf '%s' "$UPDATE_URL_DEFAULT"
+}
+
+cmd_self_update() {
+  need_root self-update
+  local target tmp
+  target=$(readlink -f "$0")
+  tmp=$(mktemp)
+  step "从上游获取最新版本：$(resolve_update_url)"
+  if ! curl -fsSL --max-time 30 "$(resolve_update_url)" -o "$tmp"; then
+    rm -f "$tmp"; die_code "$E_EXTERNAL" "下载失败"
+  fi
+  if ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; die_code "$E_VALIDATE" "下载内容语法校验失败，已放弃（未改动现有文件）"
+  fi
+  if ! grep -q 'WP_CLUSTER_MAIN=1' "$tmp"; then
+    rm -f "$tmp"; die_code "$E_VALIDATE" "下载内容不是 wp-cluster，已放弃"
+  fi
+  local newver
+  newver=$(grep -m1 '^WP_CLUSTER_VERSION=' "$tmp" | cut -d'"' -f2)
+  info "当前 $WP_CLUSTER_VERSION → 上游 ${newver:-unknown}"
+  if $DRY_RUN; then rm -f "$tmp"; return 0; fi
+  cp -a "$target" "$target.bak.$(date +%Y%m%d%H%M%S)"
+  install -m 755 "$tmp" "$target"
+  rm -f "$tmp"
+  info "更新完成，已生效"
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  local purge=false
+  if [ "${1:-}" = "--purge" ]; then purge=true; fi
+  warn "将移除 wp-cluster 本体、cron、logrotate（站点与备份默认保留）"
+  confirm "继续？" || { info "已取消"; return 0; }
+
+  run rm -f /etc/cron.d/wp-cluster /etc/logrotate.d/wp-cluster /usr/local/bin/wp-cluster
+  if $purge; then
+    confirm_typed "将同时删除全部站点、数据库与备份" "删除" || { info "已取消"; return 0; }
+    local d
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      ols_conf remove "$d" >/dev/null 2>&1 || true
+      ext_conf remove "lsphp_$(slugify "$d")" >/dev/null 2>&1 || true
+      rm -rf "$WWW_ROOT/$d" "$VHOST_DIR/$d" "$(site_get "$d" DB_PATH)" "$BACKUP_DIR/$d" "$(meta_file "$d")"
+    done <<<"$(all_sites)"
+    ols_restart || true
+    rm -rf "$CORE_DIR" "$STATE_DIR"
+    info "站点与状态目录已清空"
+  fi
+  info "卸载完成"
+}
+
+# =============================================================================
+#  命令：verify —— 共享核心完整性校验（硬链接共享的兜底）
+# =============================================================================
+core_manifest() {
+  ( cd "$CORE_DIR" && find . -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum 2>/dev/null )
+}
+
+# 统计某站有多少文件仍与共享核心同 inode
+site_shared_count() {
+  find "$1" -maxdepth 1 -type f -links +1 2>/dev/null | wc -l | tr -d ' '
+}
+
+cmd_verify() {
+  need_root verify
+  local baseline=false check_sites=true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --baseline) baseline=true; shift ;;
+      --no-sites) check_sites=false; shift ;;
+      -*) shift ;;
+      *) shift ;;
+    esac
+  done
+
+  [ -f "$CORE_DIR/wp-load.php" ] || die_code "$E_PRECOND" "共享核心不存在: $CORE_DIR（先执行 wp-cluster init）"
+  local mf="$STATE_DIR/core.sha256"
+  local cur; cur=$(mktemp)
+  if ! core_manifest >"$cur"; then
+    rm -f "$cur"
+    die_code "$E_EXTERNAL" "无法生成核心清单"
+  fi
+  local total; total=$(wc -l <"$cur" | tr -d ' ')
+  [ "$total" -gt 0 ] || { rm -f "$cur"; die_code "$E_EXTERNAL" "核心清单为空，$CORE_DIR 可能不完整"; }
+
+  if $baseline; then
+    if $DRY_RUN; then step "[dry-run] 写入基线 $mf（$total 个文件）"; rm -f "$cur"; return 0; fi
+    cp -f "$cur" "$mf"
+    chmod 600 "$mf"
+    rm -f "$cur"
+    info "已建立核心基线：$total 个文件"
+    printf '  基线文件: %s\n' "$mf"
+    printf '  提示：核心被有意升级后需重新执行 wp-cluster verify --baseline\n'
+    return 0
+  fi
+
+  if [ ! -f "$mf" ]; then
+    rm -f "$cur"
+    warn "尚未建立核心基线，请先执行: wp-cluster verify --baseline"
+    return "$E_PRECOND"
+  fi
+
+  # 差异：< 基线有当前无（被删）、> 当前有基线无（新增/被改）
+  local diff_out drift=0
+  diff_out=$(diff "$mf" "$cur" 2>/dev/null || true)
+  drift=$(printf '%s\n' "$diff_out" | grep -cE '^[<>]' || true)
+  drift=${drift:-0}
+  local changed added removed
+  added=$(printf '%s\n' "$diff_out" | grep -cE '^>' || true); added=${added:-0}
+  removed=$(printf '%s\n' "$diff_out" | grep -cE '^<' || true); removed=${removed:-0}
+  changed=$((added > removed ? removed : added))
+
+  local link_dup
+  link_dup=$(find "$CORE_DIR" -type f -links +1 2>/dev/null | wc -l | tr -d ' ')
+  local sharers
+  sharers=$(all_sites | while IFS= read -r _d; do
+    [ -n "$_d" ] || continue
+    _s=$(site_get "$_d" SITE_DIR)
+    _n=$(site_shared_count "$_s")
+    if [ "$_n" -gt 0 ]; then printf '%s\n' "$_d"; fi
+  done | wc -l | tr -d ' ')
+
+  if $JSON; then
+    printf '{"core":"%s","files":%s,"hardlinked_files":%s,"sharing_sites":%s,"drift":%s,"changed":%s,"added":%s,"removed":%s,"baseline":"%s"\n' \
+      "$(json_escape "$CORE_DIR")" "$total" "$link_dup" "$sharers" "$drift" "$changed" "$added" "$removed" "$(json_escape "$mf")"
+  else
+    printf '%s\n' "${C_BD}共享核心完整性${C_0}"
+    printf '  核心目录 : %s\n' "$CORE_DIR"
+    printf '  文件数量 : %s；其中 %s 个文件被硬链接共享，当前 %s 个站点复用\n' "$total" "$link_dup" "$sharers"
+    if [ "$drift" -eq 0 ]; then
+      printf '  基线比对 : %s通过%s，无改动\n' "$C_G" "$C_0"
+    else
+      printf '  基线比对 : %s发现 %s 处差异%s（新增 %s / 删除 %s）\n' "$C_R" "$drift" "$C_0" "$added" "$removed"
+      printf '  受影响的站点：全部（共享 inode）\n'
+      printf '  最近差异（最多 10 条）：\n'
+      printf '%s\n' "$diff_out" | grep -E '^[<>]' | head -10 | sed 's/^/    /'
+    fi
+  fi
+
+  local rc=0
+  [ "$drift" -eq 0 ] || rc=$E_VALIDATE
+
+  local -a site_rows=()
+  if $check_sites; then
+    local d sdir shared db idx iss
+    if ! $JSON; then
+      printf '\n%s\n' "${C_BD}站点隔离状态${C_0}"
+      printf '%-28s %-9s %-8s %-7s %s\n' "域名" "核心共享" "独立库" "收录" "状态"
+      printf '%.0s─' {1..78}; echo
+    fi
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      sdir=$(site_get "$d" SITE_DIR); db=$(site_get "$d" DB_PATH)
+      shared=$(site_shared_count "$sdir")
+      local dbok="✗" idxs="?"
+      if [ -f "$db" ]; then dbok="✓"; fi
+      if [ "$(site_get "$d" INDEX)" = "1" ]; then idxs="index"; else idxs="noindex"; fi
+      if [ "$shared" -gt 0 ] && [ "$dbok" = "✓" ]; then iss="${C_G}● ok${C_0}"
+      elif [ "$dbok" != "✓" ]; then iss="${C_R}● 数据库缺失${C_0}"; rc=$E_FAIL
+      else iss="${C_D}● 独立核心${C_0}"; fi
+      if [ "$shared" -gt 0 ]; then site_rows+=("$d|1|$dbok|$idxs"); else site_rows+=("$d|0|$dbok|$idxs"); fi
+      if ! $JSON; then
+        printf '%-28s %-9s %-8s %-7s %s\n' "$d" "$([ "$shared" -gt 0 ] && echo 是 || echo 否)" "$dbok" "$idxs" "$iss"
+      fi
+    done <<<"$(all_sites)"
+  fi
+
+  if $JSON; then
+    printf ',"sites":['
+    local f=1 srow
+    for srow in "${site_rows[@]}"; do
+      IFS='|' read -r _d _sh _db _ix <<<"$srow"
+      [ "$f" -eq 1 ] || printf ','
+      f=0
+      printf '{"domain":"%s","core_shared":%s,"db":%s,"index":%s}' \
+        "$(json_escape "$_d")" "$_sh" "$([ "$_db" = "✓" ] && echo true || echo false)" \
+        "$([ "$_ix" = "index" ] && echo 1 || echo 0)"
+    done
+    printf ']}\n'
+    rm -f "$cur"
+    [ "$rc" -eq 0 ] || return "$rc"
+    return 0
+  fi
+
+  printf '\n'
+  if [ "$rc" -eq 0 ]; then
+    info "核验通过"
+  else
+    err "核验未通过（退出码 $rc）"
+  fi
+  rm -f "$cur"
+  return "$rc"
+}
+
+# =============================================================================
+#  命令：isolate —— 单站故障隔离
+# =============================================================================
+# 两个层面：
+#   1) --core      把该站核心文件从共享 inode 拆出来（该站被入侵/改坏不会传染其他站）
+#   2) --php-pool  为该站单独分配 PHP 进程池（该站打满不抢其他站的子进程）
+ext_conf() {
+  python3 - "$LSWS_CONF" "$@" <<'PY'
+import re, sys
+conf, action = sys.argv[1], sys.argv[2]
+args = sys.argv[3:]
+lines = open(conf, encoding='utf-8').read().splitlines()
+BLOCK = re.compile(r'^extProcessor\s+(\S+?)\s*\{')
+
+def ranges():
+    out, cur = [], None
+    for i, l in enumerate(lines):
+        m = BLOCK.match(l)
+        if m and cur is None:
+            cur = [m.group(1), i]
+        elif cur is not None and l.strip() == '}':
+            cur.append(i); out.append(tuple(cur)); cur = None
+    return out
+
+if action == 'has':
+    sys.exit(0 if any(n == args[0] for n, s, e in ranges()) else 1)
+elif action == 'names':
+    for n, s, e in ranges():
+        print(n)
+    sys.exit(0)
+elif action == 'remove':
+    drop = set()
+    for n, s, e in ranges():
+        if n == args[0]:
+            drop.update(range(s, e + 1))
+    if not drop:
+        sys.exit(0)
+    new = [l for i, l in enumerate(lines) if i not in drop]
+    open(conf, 'w', encoding='utf-8').write(chr(10).join(new) + chr(10))
+    sys.exit(0)
+elif action == 'add':
+    name, children, sock = args[0], args[1], args[2]
+    if any(n == name for n, s, e in ranges()):
+        sys.exit(0)
+    block = f"""extProcessor {name} {{
+  type                            lsapi
+  address                         uds://{sock}
+  maxConns                        {children}
+  env                             PHP_LSAPI_CHILDREN={children}
+  env                             LSAPI_AVOID_FORK=200M
+  initTimeout                     60
+  retryTimeout                    0
+  persistConn                     1
+  respBuffer                      0
+  autoStart                       1
+  path                            lsphp83/bin/lsphp
+  backlog                         100
+  instances                       1
+  priority                        0
+  memSoftLimit                    0
+  memHardLimit                    0
+  procSoftLimit                   400
+  procHardLimit                   450
+}}
+"""
+    lines += block.rstrip('\n').splitlines()
+    open(conf, 'w', encoding='utf-8').write(chr(10).join(lines) + chr(10))
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+vh_handler() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import re, sys
+vh, action, name = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(vh, encoding='utf-8').read().splitlines()
+HDR = re.compile(r'^scripthandler\s*\{')
+out, skip = [], False
+for l in lines:
+    if HDR.match(l):
+        skip = True
+        continue
+    if skip:
+        if l.strip() == '}':
+            skip = False
+        continue
+    out.append(l)
+if action == 'add':
+    while out and out[-1].strip() == '':
+        out.pop()
+    out += ['', 'scripthandler  {', f'  add                     lsapi:{name} php', '}']
+open(vh, 'w', encoding='utf-8').write(chr(10).join(out) + chr(10))
+PY
+}
+
+cmd_isolate() {
+  need_root isolate
+  local domain="" do_core=false pool="" undo=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --core) do_core=true; shift ;;
+      --php-pool) pool="${2:-$POOL_CHILDREN_DEFAULT}"; shift 2 ;;
+      --undo) undo=true; shift ;;
+      -*) die_code "$E_USAGE" "isolate 未知参数: $1" ;;
+      *) domain="$1"; shift ;;
+    esac
+  done
+  [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster isolate <domain> [--core] [--php-pool N] [--undo]"
+  require_site "$domain"
+
+  local sdir vh slug pool_name
+  sdir=$(site_get "$domain" SITE_DIR)
+  vh="$VHOST_DIR/$domain/vhconf.conf"
+  slug=$(slugify "$domain")
+  pool_name="lsphp_${slug}"
+
+  if ! $do_core && [ -z "$pool" ] && ! $undo; then
+    # 没给动作就报告当前隔离状态
+    local shared
+    shared=$(site_shared_count "$sdir")
+    printf '%s\n' "${C_BD}隔离状态${C_0} $domain"
+    printf '  核心共享文件 : %s 个（0 表示已完全独立）\n' "$shared"
+    if ext_conf has "$pool_name"; then
+      printf '  独立 PHP 池  : %s 已启用\n' "$pool_name"
+    else
+      printf '  独立 PHP 池  : 未启用（与全站共用 lsphp 池）\n'
+    fi
+    return 0
+  fi
+
+  if $undo; then
+    local rc=0
+    if ext_conf has "$pool_name"; then
+      if $DRY_RUN; then
+        step "[dry-run] 移除 PHP 池 $pool_name"
+      else
+        # 顺序很重要：先摘掉 vhost 的引用，再删 extProcessor，否则校验会因悬空引用失败
+        local vh_bak="$vh.bak.$$"
+        cp -a "$vh" "$vh_bak" 2>/dev/null || true
+        vh_handler "$vh" remove ""
+        if ! ols_validate; then
+          cp -a "$vh_bak" "$vh" 2>/dev/null || true
+          rm -f "$vh_bak"
+          die_code "$E_VALIDATE" "撤销 scripthandler 后校验失败，已回滚"
+        fi
+        if ols_txn "移除 PHP 池" ext_conf remove "$pool_name"; then
+          rm -f "$vh_bak"
+          ols_restart
+          rm -f "/tmp/lshttpd/${slug}.sock" 2>/dev/null || true
+        else
+          cp -a "$vh_bak" "$vh" 2>/dev/null || true
+          rm -f "$vh_bak"
+          rc=1
+        fi
+      fi
+    else
+      info "该站没有独立 PHP 池，无需撤销"
+    fi
+    info "已撤销 PHP 池隔离（核心拆链不可逆，如需回归共享请重建站点）"
+    return "$rc"
+  fi
+
+  local rc=0
+  if $do_core; then
+    step "拆分 $domain 的核心硬链接（只影响本站）"
+    local n=0 f tmpf
+    if $DRY_RUN; then
+      printf '  [dry-run] 将拆分 %s 个文件\n' "$(find "$sdir" -type f -links +1 2>/dev/null | wc -l | tr -d ' ')"
+    else
+      while IFS= read -r -d '' f; do
+        tmpf="${f}.wpc-tmp"
+        if cp -a "$f" "$tmpf" 2>/dev/null && mv -f "$tmpf" "$f" 2>/dev/null; then
+          n=$((n + 1))
+        else
+          rm -f "$tmpf" 2>/dev/null || true
+        fi
+      done < <(find "$sdir" -type f -links +1 -print0 2>/dev/null)
+      info "已拆分 $n 个文件（该站此后不再受共享核心影响，磁盘占用增加）"
+    fi
+  fi
+
+  if [ -n "$pool" ]; then
+    case "$pool" in ''|*[!0-9]*) die_code "$E_USAGE" "--php-pool 需要数字";; esac
+    if [ "$pool" -lt 1 ] || [ "$pool" -gt 30 ]; then
+      die_code "$E_USAGE" "--php-pool 取值 1-30"
+    fi
+    step "为 $domain 创建独立 PHP 进程池（$pool 个子进程）"
+    local sock="/tmp/lshttpd/${slug}.sock"
+    if $DRY_RUN; then
+      printf '  [dry-run] extProcessor %s + vhost scripthandler\n' "$pool_name"
+    else
+      ols_txn "创建 PHP 池" ext_conf add "$pool_name" "$pool" "$sock" \
+        || die_code "$E_VALIDATE" "写入 extProcessor 失败，已回滚"
+      vh_handler "$vh" add "$pool_name"
+      if ! ols_validate; then
+        vh_handler "$vh" remove ""
+        ext_conf remove "$pool_name"
+        die_code "$E_VALIDATE" "vhost 不支持 scripthandler，已回滚（该 OLS 版本需用全局池）"
+      fi
+      ols_restart
+      info "独立 PHP 池已生效：$pool_name（$sock）"
+    fi
+  fi
+
+  if ! $DRY_RUN; then
+    local code; code=$(http_code "$(site_get "$domain" URL)" 12)
+    if [ "$code" = "200" ]; then
+      info "站点仍正常（HTTP 200）"
+    else
+      warn "站点返回 HTTP $code，请检查 $LSWS_HOME/logs/error.log"
+      rc=$E_FAIL
+    fi
+  fi
+  return "$rc"
+}
+
+# =============================================================================
+#  命令：guard —— 巡检守护（systemd timer）
+# =============================================================================
+guard_run() {
+  local log="$LOG_DIR/guard.log" sdir="/var/lib/wp-cluster/guard" rc=0
+  mkdir -p "$sdir" 2>/dev/null || true
+  local ts; ts=$(date '+%F %T')
+
+  if ! systemctl is-active --quiet lsws; then
+    printf '%s [CRITICAL] lsws 未运行，尝试重启\n' "$ts" >>"$log"
+    if systemctl restart lsws >/dev/null 2>&1; then
+      sleep 4
+      if systemctl is-active --quiet lsws; then
+        printf '%s [RECOVER] lsws 重启成功\n' "$ts" >>"$log"
+      else
+        printf '%s [CRITICAL] lsws 重启后仍未起来\n' "$ts" >>"$log"
+      fi
+    else
+      printf '%s [CRITICAL] lsws 重启命令失败\n' "$ts" >>"$log"
+    fi
+  fi
+
+  local d url code ff fails wrote=0 total=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    total=$((total + 1))
+    url=$(site_get "$d" URL)
+    code=$(http_code "$url" 10)
+    ff="$sdir/$d.fail"
+    if [ "$code" = "200" ]; then
+      if [ -f "$ff" ]; then
+        printf '%s [RECOVER] %s 恢复正常\n' "$ts" "$d" >>"$log"
+        wrote=$((wrote + 1))
+        rm -f "$ff"
+      fi
+      continue
+    fi
+    wrote=$((wrote + 1))
+    fails=$(cat "$ff" 2>/dev/null || echo 0)
+    case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+    fails=$((fails + 1))
+    printf '%s\n' "$fails" >"$ff"
+    if [ "$fails" -ge "$GUARD_FAIL_THRESHOLD" ]; then
+      printf '%s [CRITICAL] %s HTTP %s（连续 %s 次）\n' "$ts" "$d" "$code" "$fails" >>"$log"
+      rc=1
+    else
+      printf '%s [WARN] %s HTTP %s（连续 %s 次）\n' "$ts" "$d" "$code" "$fails" >>"$log"
+    fi
+  done <<<"$(all_sites)"
+
+  # 无异常时也留一行心跳：否则「日志为空」无法区分「没跑」和「全好」
+  if [ "$wrote" -eq 0 ]; then
+    if $DRY_RUN; then
+      step "[dry-run] 巡检正常，将记录心跳（$total 站）"
+    else
+      printf '%s [OK] 巡检通过 sites=%s\n' "$ts" "$total" >>"$log"
+    fi
+  fi
+
+  return "$rc"
+}
+
+cmd_guard() {
+  need_root guard
+  local action="${1:-status}"
+  local unit=/etc/systemd/system/wp-cluster-guard.service
+  local timer=/etc/systemd/system/wp-cluster-guard.timer
+  local self; self=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+
+  case "$action" in
+    install)
+      if $DRY_RUN; then step "[dry-run] 安装 guard timer"; return 0; fi
+      write_file "$unit" <<EOF
+[Unit]
+Description=wp-cluster guard（站点巡检 + OLS 自愈）
+After=network-online.target lsws.service
+
+[Service]
+Type=oneshot
+ExecStart=$self guard run
+SuccessExitStatus=0 1
+EOF
+      write_file "$timer" <<EOF
+[Unit]
+Description=wp-cluster guard 定时巡检
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=$GUARD_INTERVAL
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl daemon-reload
+      systemctl enable --now wp-cluster-guard.timer >/dev/null 2>&1 || \
+        die_code "$E_EXTERNAL" "启用 guard timer 失败（systemctl status wp-cluster-guard.timer）"
+      info "guard 已启用（每 $GUARD_INTERVAL 巡检一次）"
+      printf '  日志: %s/guard.log\n' "$LOG_DIR"
+      ;;
+    remove)
+      if $DRY_RUN; then step "[dry-run] 移除 guard"; return 0; fi
+      systemctl disable --now wp-cluster-guard.timer >/dev/null 2>&1 || true
+      rm -f "$unit" "$timer"
+      systemctl daemon-reload
+      info "guard 已移除"
+      ;;
+    run)
+      guard_run || true
+      ;;
+    status)
+      local active="inactive"
+      if systemctl is-active --quiet wp-cluster-guard.timer 2>/dev/null; then active="active"; fi
+      printf '%s\n' "${C_BD}guard 状态${C_0}"
+      printf '  timer    : %s\n' "$active"
+      if [ "$active" = "active" ]; then
+        local nxt; nxt=$(systemctl status wp-cluster-guard.timer --no-pager 2>/dev/null | awk -F'Trigger: ' '/Trigger:/{print $2; exit}')
+        printf '  下次巡检 : %s\n' "${nxt:-未知}"
+        local last; last=$(systemctl show wp-cluster-guard.service -p InactiveEnterTimestamp --value 2>/dev/null)
+        printf '  上次巡检 : %s\n' "${last:-未执行}"
+      fi
+      printf '  阈值     : 连续 %s 次失败记 CRITICAL\n' "$GUARD_FAIL_THRESHOLD"
+      printf '  日志     : %s/guard.log\n' "$LOG_DIR"
+      if [ -f "$LOG_DIR/guard.log" ]; then
+        printf '  最近记录 :\n'
+        tail -8 "$LOG_DIR/guard.log" | sed 's/^/    /'
+      else
+        printf '  最近记录 : 暂无异常（巡检未发现故障）\n'
+      fi
+      ;;
+    *)
+      die_code "$E_USAGE" "用法: wp-cluster guard install|remove|status|run"
+      ;;
+  esac
+}
+
+# =============================================================================
+#  命令：export / adopt —— 单站独立迁移（跨机器、跨域名）
+# =============================================================================
+cmd_export() {
+  need_root export
+  local domain="" out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|--output) out="${2:-}"; shift 2 ;;
+      -*) die_code "$E_USAGE" "export 未知参数: $1" ;;
+      *) domain="$1"; shift ;;
+    esac
+  done
+  [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster export <domain> [-o 文件]"
+  require_site "$domain"
+
+  local dir db url mode title admin_user idx theme wpv ts stage file
+  dir=$(site_get "$domain" SITE_DIR)
+  db=$(site_get "$domain" DB_PATH)
+  url=$(site_get "$domain" URL)
+  mode=$(site_get "$domain" MODE)
+  title=$(site_get "$domain" TITLE)
+  admin_user=$(site_get "$domain" ADMIN_USER)
+  idx=$(site_get "$domain" INDEX)
+  ts=$(date +%Y%m%d-%H%M%S)
+  file=${out:-"$BACKUP_DIR/$domain/${domain}-export-${ts}.tar.gz"}
+
+  if $DRY_RUN; then
+    step "[dry-run] 导出 $domain → $file"
+    return 0
+  fi
+
+  stage=$(mktemp -d)
+  step "导出 $domain"
+  snapshot_db "$db" "$stage/database.sqlite" || cp -f "$db" "$stage/database.sqlite"
+
+  # wp-content + 根目录 .htaccess/robots.txt（LSCache 规则在 .htaccess 里）
+  local inc=(wp-content)
+  if [ -f "$dir/.htaccess" ]; then inc+=(".htaccess"); fi
+  if [ -f "$dir/robots.txt" ]; then inc+=("robots.txt"); fi
+  tar czf "$stage/files.tar.gz" -C "$dir" \
+    --exclude='wp-content/cache' --exclude='wp-content/litespeed' \
+    --exclude='wp-content/upgrade' --exclude='wp-content/ai1wm-backups' \
+    --exclude='wp-content/*.log' "${inc[@]}" 2>/dev/null \
+    || { rm -rf "$stage"; die_code "$E_EXTERNAL" "文件打包失败"; }
+
+  wpv=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root core version 2>/dev/null || echo "-")
+  theme=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root theme list --status=active --field=name 2>/dev/null | head -1 || true)
+  "$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root plugin list --status=active --field=name 2>/dev/null \
+    >"$stage/plugins.txt" || : >"$stage/plugins.txt"
+
+  python3 - "$stage/manifest.json" "$domain" "$url" "$mode" "$wpv" "$title" "$admin_user" "$idx" "${theme:-}" "$stage/plugins.txt" "$dir" "$("$PHP_BIN" -r 'echo PHP_VERSION;' 2>/dev/null || echo '-')" <<'PY'
+import json, sys
+path, domain, url, mode, wpv, title, admin, idx, theme, plugfile, sitedir, phpver = sys.argv[1:13]
+plugins = [l.strip() for l in open(plugfile, encoding='utf-8') if l.strip()]
+data = {
+    "format": "wp-cluster-export/1",
+    "domain": domain, "url": url, "mode": mode,
+    "site_dir": sitedir,
+    "wp_version": wpv, "title": title, "admin_user": admin,
+    "index": int(idx or 0), "theme": theme,
+    "plugins_active": plugins,
+    "php_version": phpver,
+    "exported_at": __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+}
+json.dump(data, open(path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+
+  ( cd "$stage" && sha256sum database.sqlite files.tar.gz manifest.json >SHA256SUMS )
+  mkdir -p "$(dirname "$file")"
+  tar czf "$file" -C "$stage" database.sqlite files.tar.gz manifest.json SHA256SUMS
+  if ! gzip -t "$file" 2>/dev/null; then
+    rm -f "$file"; rm -rf "$stage"
+    die_code "$E_EXTERNAL" "导出包损坏"
+  fi
+  rm -rf "$stage"
+
+  info "导出完成"
+  printf '  文件  : %s\n' "$file"
+  printf '  大小  : %s\n' "$(du -h "$file" | awk '{print $1}')"
+  printf '  迁移  : scp 到目标机后执行 wp-cluster adopt <包> --domain 新域名\n'
+}
+
+manifest_get() {
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+v=d.get(sys.argv[2],"")
+print("" if v is None else v)
+' "$1" "$2" 2>/dev/null || true
+}
+
+manifest_plugins() {
+  python3 -c '
+import json,sys
+for p in json.load(open(sys.argv[1])).get("plugins_active",[]):
+    print(p)
+' "$1" 2>/dev/null || true
+}
+
+cmd_adopt() {
+  need_root adopt
+  local bundle="" domain="" mode="port" port="" want_index="" want_ssl=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --domain) domain="${2:-}"; shift 2 ;;
+      --mode) mode="${2:-}"; shift 2 ;;
+      --port) port="${2:-}"; shift 2 ;;
+      --index) want_index=1; shift ;;
+      --no-index) want_index=0; shift ;;
+      --ssl) want_ssl=true; shift ;;
+      -*) die_code "$E_USAGE" "adopt 未知参数: $1" ;;
+      *) bundle="$1"; shift ;;
+    esac
+  done
+  [ -n "$bundle" ] && [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster adopt <导出包> --domain <新域名> [--mode port|domain] [--port N] [--index] [--ssl]"
+  [ -f "$bundle" ] || die_code "$E_NOENT" "导出包不存在: $bundle"
+  domain=${domain,,}
+  validate_domain "$domain" || die_code "$E_USAGE" "域名格式非法: $domain"
+  if site_exists "$domain"; then die_code "$E_EXISTS" "站点已存在: $domain"; fi
+  [ -f "$CORE_DIR/wp-load.php" ] || die_code "$E_PRECOND" "尚未初始化，请先执行: wp-cluster init"
+
+  local stage; stage=$(mktemp -d)
+  tar xzf "$bundle" -C "$stage" 2>/dev/null || { rm -rf "$stage"; die_code "$E_VALIDATE" "导出包解包失败"; }
+  if [ -f "$stage/SHA256SUMS" ]; then
+    ( cd "$stage" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) \
+      || { rm -rf "$stage"; die_code "$E_VALIDATE" "校验和不匹配，导出包可能损坏"; }
+  fi
+  [ -f "$stage/manifest.json" ] || { rm -rf "$stage"; die_code "$E_VALIDATE" "缺少 manifest.json"; }
+  if tar tzf "$stage/files.tar.gz" 2>/dev/null | grep -qE '(^|/)\.\./|^/'; then
+    rm -rf "$stage"; die_code "$E_VALIDATE" "导出包含非法路径，已拒绝"
+  fi
+
+  local old_url old_dir title admin_user old_index theme
+  old_url=$(manifest_get "$stage/manifest.json" url)
+  old_dir=$(manifest_get "$stage/manifest.json" site_dir)
+  title=$(manifest_get "$stage/manifest.json" title)
+  admin_user=$(manifest_get "$stage/manifest.json" admin_user)
+  old_index=$(manifest_get "$stage/manifest.json" index)
+  theme=$(manifest_get "$stage/manifest.json" theme)
+  [ -n "$old_url" ] || { rm -rf "$stage"; die_code "$E_VALIDATE" "manifest 缺少 url"; }
+  [ -n "$admin_user" ] || admin_user="admin"
+  [ -n "$want_index" ] || { if [ "$old_index" = "1" ]; then want_index=1; else want_index=0; fi; }
+
+  info "从导出包接管：$old_url → $domain"
+  printf '  原 WP 版本: %s\n' "$(manifest_get "$stage/manifest.json" wp_version)"
+  printf '  原插件数  : %s\n' "$(manifest_plugins "$stage/manifest.json" | wc -l | tr -d ' ')"
+
+  # 1) 先按标准流程建骨架（保证 vhost/listener/权限/OSS 注册全部正确）
+  local add_args=("$domain" --mode "$mode" --title "${title:-$domain}" --admin-user "$admin_user")
+  if [ -n "$port" ]; then add_args+=(--port "$port"); fi
+  if [ "$want_index" = "1" ]; then add_args+=(--index); fi
+  if $want_ssl; then add_args+=(--ssl); fi
+  if $DRY_RUN; then
+    step "[dry-run] wp-cluster add ${add_args[*]}"
+    rm -rf "$stage"
+    return 0
+  fi
+  cmd_add "${add_args[@]}"
+
+  local dir db new_url
+  dir=$(site_get "$domain" SITE_DIR)
+  db=$(site_get "$domain" DB_PATH)
+  new_url=$(site_get "$domain" URL)
+
+  # 2) 覆盖数据库
+  step "恢复数据库"
+  replace_db "$stage/database.sqlite" "$db" || { rm -rf "$stage"; die_code "$E_EXTERNAL" "数据库写入失败"; }
+  if ! sqlite_ok "$db"; then
+    rm -rf "$stage"
+    die_code "$E_VALIDATE" "恢复后的数据库未通过完整性检查（PRAGMA quick_check）"
+  fi
+
+  # 3) 覆盖 wp-content（含插件/主题/上传/mu-plugins/.htaccess）
+  step "恢复站点文件"
+  rm -rf "$dir/wp-content"
+  tar xzf "$stage/files.tar.gz" -C "$dir" 2>/dev/null \
+    || { rm -rf "$stage"; die_code "$E_EXTERNAL" "文件恢复失败"; }
+  strip_mu_plugins "$dir/wp-content"
+
+  # 4) 修正 db.php 里的绝对路径（drop-in 写死了原站目录）
+  if [ -n "$old_dir" ] && [ "$old_dir" != "$dir" ] && [ -f "$dir/wp-content/db.php" ]; then
+    sed -i "s|$old_dir|$dir|g" "$dir/wp-content/db.php" 2>/dev/null || true
+  fi
+
+  # 5) 重新生成 wp-config（新域名、新库路径、新盐）
+  local noindex_const="true"
+  if [ "$want_index" = "1" ]; then noindex_const="false"; fi
+  render_wpconfig "$new_url" "$db" "$(slugify "$domain")" "$noindex_const" \
+    "$(site_get "$domain" PHP_MEMORY)" "$domain" | write_file "$dir/wp-config.php"
+
+  # 6) 域名替换（SQLite 下 wp-cli 可用）
+  step "替换域名引用"
+  local rep
+  rep=$(wp_run "$dir" search-replace "$old_url" "$new_url" --all-tables --precise --report-changed-only 2>&1 | tail -3 || true)
+  wp_quiet "$dir" option update home "$new_url" >/dev/null 2>&1 || true
+  wp_quiet "$dir" option update siteurl "$new_url" >/dev/null 2>&1 || true
+  if [ -n "$rep" ]; then printf '%s\n' "$rep" | sed 's/^/    /'; fi
+
+  # 7) 激活插件与主题
+  local pls=() p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ -d "$dir/wp-content/plugins/$p" ]; then pls+=("$p"); fi
+  done <<<"$(manifest_plugins "$stage/manifest.json")"
+  if [ ${#pls[@]} -gt 0 ]; then
+    wp_quiet "$dir" plugin activate "${pls[@]}" >/dev/null 2>&1 || warn "部分插件激活失败"
+  fi
+  if [ -n "$theme" ] && [ -d "$dir/wp-content/themes/$theme" ]; then
+    wp_quiet "$dir" theme activate "$theme" >/dev/null 2>&1 || warn "主题激活失败: $theme"
+  fi
+  local active_theme=""
+  active_theme=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root theme list --status=active --field=name 2>/dev/null | head -1 || true)
+  if [ -z "$active_theme" ]; then
+    local cand2
+    cand2=$(find "$dir/wp-content/themes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 | xargs -r basename)
+    if [ -n "$cand2" ]; then
+      wp_quiet "$dir" theme activate "$cand2" >/dev/null 2>&1 || true
+      active_theme=$("$PHP_BIN" "$WP_CLI" --path="$dir" --allow-root theme list --status=active --field=name 2>/dev/null | head -1 || true)
+    fi
+  fi
+  if [ -z "$active_theme" ]; then
+    warn "接管后没有可用主题，页面会是空白"
+  fi
+
+  ensure_ownership "$dir" "$db"
+  wp_quiet "$dir" rewrite flush >/dev/null 2>&1 || true
+  wp_quiet "$dir" litespeed-purge all >/dev/null 2>&1 || true
+  rm -rf "$stage"
+
+  # 8) 验收
+  local code probe
+  if [ "$mode" = "port" ]; then
+    probe="http://127.0.0.1:$(site_get "$domain" PORT)/?wpcluster-adopt=$RANDOM$RANDOM"
+    code=$(http_code "$probe" 15)
+  else
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Host: $domain" \
+      --max-time 15 "http://127.0.0.1/?wpcluster-adopt=$RANDOM$RANDOM" 2>/dev/null || echo 000)
+  fi
+  if [ "$code" != "200" ]; then
+    warn "接管后站点返回 HTTP $code"
+    printf '  排查: wp-cluster logs %s；%s/logs/error.log\n' "$domain" "$LSWS_HOME"
+    return "$E_EXTERNAL"
+  fi
+  local abytes
+  abytes=$(curl -s -o /dev/null -w '%{size_download}' --max-time 15 "$probe" 2>/dev/null || echo 0)
+  if [ "${abytes:-0}" -lt 500 ]; then
+    warn "接管后首页只有 $abytes 字节（疑似空白页）"
+    return "$E_EXTERNAL"
+  fi
+
+  local post; post=$(wp_run "$dir" post list --post_type=post --format=count 2>/dev/null || echo "?")
+  info "接管完成（HTTP 200）"
+  printf '  域名   : %s\n  地址   : %s\n  文章数 : %s\n' "$domain" "$new_url" "$post"
+  printf '  %s后台密码沿用原站%s（原管理员 %s）\n' "$C_Y" "$C_0" "$admin_user"
+}
+
+# =============================================================================
+#  命令：cf —— Cloudflare 状态 / 优选 IP 实测 / SaaS 接入计划
+# =============================================================================
+cf_trace() {
+  curl -s --max-time 8 "https://$1/cdn-cgi/trace" 2>/dev/null || true
+}
+
+cf_field() {
+  printf '%s\n' "${1:-}" | awk -F= -v k="$2" '$1==k{print $2; exit}'
+}
+
+resolve_v4() {
+  local h=$1 out=""
+  if have getent; then
+    out=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)
+  fi
+  if [ -z "$out" ] && have dig; then
+    out=$(dig +short A "$h" 2>/dev/null | grep -E '^[0-9.]+$' | paste -sd, - || true)
+  fi
+  printf '%s' "${out:-?}"
+}
+
+# 返回 "connect|tls|ttfb|httpcode"
+cf_timing() {
+  local url=$1
+  curl -s -o /dev/null --max-time 10 \
+    -w '%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{http_code}' \
+    "$url" 2>/dev/null || printf '0|0|0|000'
+}
+
+cmd_cf() {
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    status) cmd_cf_status "$@" ;;
+    probe)  cmd_cf_probe "$@" ;;
+    plan)   cmd_cf_plan "$@" ;;
+    *) die_code "$E_USAGE" "用法: wp-cluster cf status [域] | cf probe | cf plan <域> [--cname X] [--fallback Y]" ;;
+  esac
+}
+
+cmd_cf_status() {
+  local target="${1:-}" domains
+  case "$target" in
+    --all|"") domains=$(all_sites) ;;
+    *) require_site "$target"; domains="$target" ;;
+  esac
+  local d mode rows=() n=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    mode=$(site_get "$d" MODE)
+    [ "$mode" = "domain" ] || continue
+    local url tr t
+    url="https://$d/?wpc-cf=$RANDOM"
+    tr=$(cf_trace "$d")
+    t=$(cf_timing "$url")
+    local dns colo tls code conn hand ttfb proxy
+    dns=$(resolve_v4 "$d")
+    colo=$(cf_field "$tr" colo); tls=$(cf_field "$tr" tls)
+    IFS='|' read -r conn hand ttfb code <<<"$t"
+    proxy="灰云"
+    if curl -sI --max-time 8 "$url" 2>/dev/null | grep -qi '^server: *cloudflare'; then proxy="橙云"; fi
+    local cache; cache=$(curl -sI --max-time 10 "$url" 2>/dev/null | grep -i '^cf-cache-status:' | awk '{print $2}' | tr -d '\r' | head -1)
+    rows+=("$d|${code:-000}|${dns:--}|${colo:--}|${tls:--}|${conn:-0}|${hand:-0}|${ttfb:-0}|${cache:--}|$proxy")
+    n=$((n + 1))
+  done <<<"$domains"
+
+  if [ "$n" -eq 0 ]; then
+    warn "没有域名模式的站点（端口模式不经过 Cloudflare）"
+    return 0
+  fi
+
+  if $JSON; then
+    printf '['
+    local first=1 r
+    for r in "${rows[@]}"; do
+      IFS='|' read -r d code dns colo tls conn hand ttfb cache proxy <<<"$r"
+      [ "$first" -eq 1 ] || printf ','
+      first=0
+      printf '{"domain":"%s","http_code":"%s","dns":"%s","colo":"%s","tls":"%s","connect":%s,"handshake":%s,"ttfb":%s,"cf_cache":"%s","proxy":"%s"}' \
+        "$(json_escape "$d")" "$code" "$(json_escape "$dns")" "$colo" "$tls" \
+        "$(fmt_sec "$conn")" "$(fmt_sec "$hand")" "$(fmt_sec "$ttfb")" "$(json_escape "$cache")" "$proxy"
+    done
+    printf ']\n'
+    return 0
+  fi
+
+  printf '%s\n' "${C_BD}Cloudflare 链路状态${C_0}（测点为本机出口，TTFB 含跨境往返）"
+  printf '%-24s %-5s %-22s %-5s %-7s %-8s %-8s %-7s %s\n' \
+    "域名" "HTTP" "解析 IP" "节点" "TLS" "TLS握手" "TTFB" "代理" "CF缓存"
+  printf '%.0s─' {1..104}; echo
+  local r
+  for r in "${rows[@]}"; do
+    IFS='|' read -r d code dns colo tls conn hand ttfb cache proxy <<<"$r"
+    printf '%-24s %-5s %-22s %-5s %-7s %-8s %-8s %-7s %s\n' \
+      "$d" "$code" "$dns" "$colo" "$tls" "$(fmt_sec "$hand")s" "$(fmt_sec "$ttfb")s" "$proxy" "$cache"
+  done
+  echo
+  printf '  %s提示%s：colo 是国内访问的落地节点。若长期是 AMS/LAX 而目标用户在国内，\n' "$C_D" "$C_0"
+  printf '        说明走了默认 anycast + 绕路，需要「优选 IP（SaaS 自定义主机名）」才能改善：\n'
+  printf '        wp-cluster cf probe   → 实测候选优选域名；wp-cluster cf plan <域> → 生成接入步骤\n'
+}
+
+cmd_cf_probe() {
+  local targets="$CF_PROBE_TARGETS" rounds="$CF_PROBE_ROUNDS"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --targets) targets="${2:-}"; shift 2 ;;
+      --rounds) rounds="${2:-3}"; shift 2 ;;
+      -*) die_code "$E_USAGE" "cf probe 未知参数: $1" ;;
+      *) shift ;;
+    esac
+  done
+  case "$rounds" in ''|*[!0-9]*) rounds=3 ;; esac
+  [ "$rounds" -ge 1 ] && [ "$rounds" -le 10 ] || rounds=3
+
+  local list="$targets,www.cloudflare.com"
+  local -a cands
+  IFS=', ' read -r -a cands <<<"$list"
+
+  printf '%s\n' "${C_BD}CF 优选候选实测${C_0}（每个目标 $rounds 轮，取最快一轮）"
+  printf '%-34s %-9s %-9s %-9s %-6s %s\n' "目标" "解析IP数" "TLS握手" "TTFB" "节点" "状态"
+  printf '%.0s─' {1..96}; echo
+
+  local out="$(mktemp)" c best_ttfb best_hand best_conn colo ips i ipcnt t conn hand ttfb code tr
+  for c in "${cands[@]}"; do
+    [ -n "$c" ] || continue
+    ips=$(resolve_v4 "$c")
+    ipcnt=0
+    if [ "$ips" != "?" ]; then ipcnt=$(printf '%s' "$ips" | tr ',' '\n' | grep -c . || true); fi
+    best_ttfb=999; best_hand=999; best_conn=999; colo="-"
+    i=0
+    while [ "$i" -lt "$rounds" ]; do
+      t=$(cf_timing "https://$c/cdn-cgi/trace")
+      IFS='|' read -r conn hand ttfb code <<<"$t"
+      if awk -v a="$ttfb" -v b="$best_ttfb" 'BEGIN{exit !(a>0 && a<b)}'; then
+        best_ttfb=$ttfb; best_hand=$hand; best_conn=$conn
+      fi
+      i=$((i + 1))
+    done
+    tr=$(cf_trace "$c")
+    local cl; cl=$(cf_field "$tr" colo); if [ -n "$cl" ]; then colo=$cl; fi
+    printf '%s|%s|%s|%s|%s|%s\n' "$best_ttfb" "$c" "$best_conn" "$best_hand" "$colo" "$ipcnt" >>"$out"
+  done
+
+  local line
+  while IFS='|' read -r ttfb c conn hand colo ipcnt; do
+    local status="${C_G}可用${C_0}" hs ts
+    if [ "$ttfb" = "999" ]; then
+      # 999 是内部哨兵值（不可达），不能当成真实耗时打印出来
+      status="${C_R}不可达${C_0}"
+      hs="n/a"; ts="n/a"
+    else
+      hs="$(fmt_sec "$hand")s"; ts="$(fmt_sec "$ttfb")s"
+    fi
+    printf '%-34s %-9s %-9s %-9s %-6s %s\n' \
+      "$c" "$ipcnt" "$hs" "$ts" "$colo" "$status"
+  done < <(sort -t'|' -k1,1n "$out")
+
+  echo
+  printf '  %s如何用%s：把「TTFB 最小且节点在国内/亚太」的那个域名，作为主域名 CNAME 的指向。\n' "$C_D" "$C_0"
+  printf '        例：<你的域名> CNAME <优选域名>（第三方 DNS 处，不勾 CF 代理）\n'
+  printf '        然后在 CF 用 SaaS 自定义主机名给该域名签发证书并回源，见 docs/CF-OPTIMIZED-IP.md\n'
+  rm -f "$out"
+  return 0
+}
+
+cmd_cf_plan() {
+  local domain="" cname="" fallback="" aux="" all=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cname) cname="${2:-}"; shift 2 ;;
+      --fallback) fallback="${2:-}"; shift 2 ;;
+      --aux) aux="${2:-}"; shift 2 ;;
+      --all) all=true; shift ;;
+      -*) die_code "$E_USAGE" "cf plan 未知参数: $1" ;;
+      *) domain="$1"; shift ;;
+    esac
+  done
+
+  if $all; then
+    printf '%s\n' "${C_BD}SaaS 优选接入清单（站群）${C_0}"
+    printf '%-26s %-34s %s\n' "加速域名" "回退源（橙云 A 记录）" "CNAME 指向"
+    printf '%.0s─' {1..100}; echo
+    local d
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      [ "$(site_get "$d" MODE)" = "domain" ] || continue
+      printf '%-26s %-34s %s\n' "$d" "${fallback:-origin.<辅助域>}" "${cname:-<优选域名>}"
+    done <<<"$(all_sites)"
+    echo
+    printf '  逐站执行：wp-cluster cf plan <域> --fallback origin.辅助域 --cname 优选域\n'
+    return 0
+  fi
+
+  [ -n "$domain" ] || die_code "$E_USAGE" "用法: wp-cluster cf plan <域> [--fallback origin.辅助域] [--cname 优选域] [--all]"
+  require_site "$domain"
+  local ip; ip=$(get_public_ip)
+  cname=${cname:-"<优选域名，用 wp-cluster cf probe 选>"}
+  fallback=${fallback:-"origin.${aux:-<你的辅助域名>}"}
+
+  cat <<PLAN
+${C_BD}Cloudflare 优选 IP 接入计划 — ${domain}${C_0}
+
+原理：主域名不再直接橙云，而是 CNAME 到「优选域名」→ 你指定的 CF 边缘 IP；
+      CF 侧用 SaaS「自定义主机名」承接证书与回源，回退源指向你的源站 ${ip}。
+
+${C_BD}0. 前置条件${C_0}
+   - 一个托管在 Cloudflare 的【辅助域名】（本例用它做 SaaS zone，例如 ${aux:-aux.example.com}）
+   - 【主域名】的 DNS 必须能改 CNAME，且${C_BD}不能处于 CF 橙云${C_0}
+     （若主域名托管在 CF，先关橙云；否则换成第三方 DNS，如 DNSPod / 华为云解析）
+   - 源站 IP：${ip}（已确认）
+
+${C_BD}1. 辅助域名里建回退源${C_0}
+   DNS  →  A  ${fallback}  →  ${ip}    （代理状态：橙云 开启）
+   SSL/TLS → 概述 → 加密模式：${C_BD}完全（严格）${C_0}
+
+${C_BD}2. 辅助域名里添加回退源${C_0}
+   SSL/TLS → 自定义主机名 → 回退源 → 填 ${fallback} → 状态变为「有效」
+
+${C_BD}3. 为主域名添加自定义主机名${C_0}
+   SSL/TLS → 自定义主机名 → 添加自定义主机名
+     主机名：${domain}
+     源服务器：默认（即 ${fallback}）
+     证书验证：TXT（推荐，改动小）或 HTTP
+   按提示在【主域名 DNS】加一条 TXT/HTTP 验证记录 → 回到 CF 刷新为「有效」
+
+${C_BD}4. 主域名指向优选域名${C_0}
+   主域名 DNS → CNAME  ${domain}  →  ${cname}
+   ${C_Y}注意：这条记录在第三方 DNS 上加，且不要开代理${C_0}
+
+${C_BD}5. 验证${C_0}
+   curl -s https://${domain}/cdn-cgi/trace | grep -E 'colo|ip|tls'
+   期望：ip 落在你优选的网段、colo 从 AMS/LAX 变为 HKG/NRT/SIN 等
+   wp-cluster cf status ${domain}     # 看 TTFB 与节点是否改善
+
+${C_BD}6. 回滚（30 秒）${C_0}
+   把主域名 CNAME 改回原记录（或直接 A 到 ${ip}），SaaS 侧不用动；
+   证书由 CF 自动续期，回滚不影响源站。
+
+${C_BD}站群扩展${C_0}
+   同一个辅助域名可为最多 ${C_BD}100 个${C_0}自定义主机名免费签发（Free/Pro/Business），
+   超出按 \$0.10/个/月。逐站重复第 3~5 步即可，
+   清单：wp-cluster cf plan --all
+PLAN
+  return 0
+}
+
+# =============================================================================
+#  入口
+# =============================================================================
+parse_globals() {
+  ARGS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) DRY_RUN=true; shift ;;
+      --json) JSON=true; shift ;;
+      --yes|-y) ASSUME_YES=true; shift ;;
+      --quiet|-q) QUIET=true; shift ;;
+      --verbose|-v) VERBOSE=true; shift ;;
+      --no-color) NO_COLOR=1; shift ;;
+      --trace) set -x; shift ;;
+      --config) CONFIG_FILE="${2:-}"; shift 2 ;;
+      --config=*) CONFIG_FILE="${1#*=}"; shift ;;
+      --version|-V) ARGS=("version"); shift ;;
+      --help|-h) ARGS=("help"); shift ;;
+      *) ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+main() {
+  parse_globals "$@"
+  load_config
+
+  local cmd="${ARGS[0]:-help}"
+  set -- "${ARGS[@]:1}"
+
+  case "$cmd" in
+    version|--version|-V) cmd_version; return 0 ;;
+    help|--help|-h) cmd_help; return 0 ;;
+  esac
+
+  need_root "$cmd"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+  # 只读命令不取全局锁，避免被长时间备份阻塞
+  case "$cmd" in
+    doctor|list|ls|info|status|health|logs|verify|cf|guard) ;;
+    *) acquire_lock ;;
+  esac
+
+  local rc=0
+  case "$cmd" in
+    doctor)      cmd_doctor "$@" ;;
+    init)        cmd_init ;;
+    add)         cmd_add "$@" ;;
+    import)      cmd_import "$@" ;;
+    list|ls)     cmd_list "$@" ;;
+    info)        cmd_info "$@" ;;
+    status)      cmd_status ;;
+    health)      cmd_health "$@" ;;
+    enable)      if [ -z "${1:-}" ]; then die_code "$E_USAGE" "用法: wp-cluster enable <domain>"; fi; cmd_set_index "$1" 1 ;;
+    disable)     if [ -z "${1:-}" ]; then die_code "$E_USAGE" "用法: wp-cluster disable <domain>"; fi; cmd_set_index "$1" 0 ;;
+    purge)       cmd_purge "$@" ;;
+    ssl)         cmd_ssl "$@" ;;
+    backup)      cmd_backup "$@" ;;
+    restore)     cmd_restore "$@" ;;
+    export)      cmd_export "$@" ;;
+    adopt)       cmd_adopt "$@" ;;
+    verify)      cmd_verify "$@" ;;
+    isolate)     cmd_isolate "$@" ;;
+    guard)       cmd_guard "$@" ;;
+    cf)          cmd_cf "$@" ;;
+    upgrade)     cmd_upgrade "$@" ;;
+    logs)        cmd_logs "$@" ;;
+    remove|rm)   cmd_remove "$@" ;;
+    cron)        cmd_cron "$@" ;;
+    self-update) cmd_self_update ;;
+    uninstall)   cmd_uninstall "$@" ;;
+    *)           err "未知命令: $cmd"; cmd_help; exit "$E_USAGE" ;;
+  esac || rc=$?
+
+  trap - ERR
+  exit "$rc"
+}
+
+main "$@"

@@ -1,0 +1,61 @@
+# wp-cluster 配置样例
+# 复制到 /etc/wp-cluster/wp-cluster.conf 后生效（未设置的项使用内置默认值）
+
+# ---------- 路径 ----------
+WWW_ROOT="/var/www"
+CORE_DIR="/var/www/wp-core"
+DB_DIR="/var/www/db"
+STATE_DIR="/etc/wp-cluster"
+BACKUP_DIR="/var/backups/wp-cluster"
+LOG_DIR="/var/log/wp-cluster"
+LOCK_FILE="/var/lock/wp-cluster.lock"
+LOCK_TIMEOUT=1800
+
+# ---------- OpenLiteSpeed ----------
+LSWS_HOME="/usr/local/lsws"
+LSWS_CONF="$LSWS_HOME/conf/httpd_config.conf"
+VHOST_DIR="$LSWS_HOME/conf/vhosts"
+CERT_DIR="$LSWS_HOME/conf/cert"
+PHP_BIN="/usr/local/lsws/lsphp83/bin/php"
+WP_CLI="/usr/local/bin/wp"
+
+# ---------- 运行用户 ----------
+WEB_USER="nobody"
+WEB_GROUP="nogroup"
+
+# ---------- 模板站 ----------
+# 留空则自动探测：按 mu-plugins 数 ×100 + 插件数 ×10 + 主题数 + 是否有媒体 打分，取最高
+# 显式指定可避免探测到不完整的站点
+TEMPLATE_SITE=""
+# 建站时跳过的模板 mu-plugin（逗号分隔，只写文件名）。
+# 模板若带「无条件 noindex」的 mu-plugin，会压过收录开关，导致 enable 之后仍 noindex。
+TEMPLATE_STRIP_MU="force-noindex.php"
+
+# ---------- 端口分配（端口模式） ----------
+PORT_START=8100
+PORT_END=8199
+
+# ---------- 站点默认值 ----------
+DEFAULT_PHP_MEMORY="128M"     # 写入 WP_MEMORY_LIMIT
+HARDLINK_PLUGINS=true         # 插件/主题用硬链接共享（省磁盘）；false 则每站独立复制
+
+# ---------- 备份保留 ----------
+BACKUP_DAILY_KEEP=7
+BACKUP_WEEKLY_KEEP=4
+BACKUP_MONTHLY_KEEP=6
+
+# ---------- 故障隔离 ----------
+POOL_CHILDREN_DEFAULT=3       # isolate --php-pool 默认子进程数（1-30）
+GUARD_INTERVAL="5min"         # guard 巡检间隔
+GUARD_FAIL_THRESHOLD=3        # 连续失败几次记 CRITICAL
+
+# ---------- Cloudflare 优选 IP ----------
+# cf probe 的候选目标（逗号分隔）。建议同时放「优选域名」和「官方域名」做对照。
+CF_PROBE_TARGETS="cf.090227.xyz,cf-cname.xingpingcn.top,cf.877774.xyz,cloudflare.182682.xyz,icook.hk,time.is"
+CF_PROBE_ROUNDS=3             # 每个目标测几轮，取最快一轮
+
+# ---------- 自更新源 ----------
+# 留空时按此顺序解析：环境变量 WP_CLUSTER_UPDATE_URL > 本项 > /etc/wp-cluster/update-url
+# > /home/.wp-cluster-update-url > 内置默认（jiaoben123/wp-cluster@main）
+# 一行安装命令会自动写标记文件，一般不需要改这里。
+SELF_UPDATE_URL=""
