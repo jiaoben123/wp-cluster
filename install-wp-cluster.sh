@@ -583,7 +583,16 @@ if [ "$MODE" = "check" ]; then
   else
     warn "wp-cli 未安装"
   fi
-  [ -f "$INSTALL_DIR/wp-cluster" ] && ok "wp-cluster: $(cat "$INSTALL_DIR/VERSION" 2>/dev/null)" || warn "wp-cluster 未安装"
+  # 以「实际装到 PATH 上的程序」为准：/root/wp-cluster 只是仓库副本，
+  # self-update 之后它不会跟着变，读它会显示旧版本、让人误以为更新失败。
+  wpc_inst=""
+  if command -v wp-cluster >/dev/null 2>&1; then
+    wpc_inst=$(wp-cluster version 2>/dev/null | head -1 | awk '{print $2}')
+  fi
+  if [ -z "${wpc_inst:-}" ] && [ -f "$INSTALL_DIR/VERSION" ]; then
+    wpc_inst=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null)
+  fi
+  if [ -n "${wpc_inst:-}" ]; then ok "wp-cluster: $wpc_inst"; else warn "wp-cluster 未安装"; fi
   systemctl is-active --quiet lsws && ok "lsws: 运行中" || warn "lsws: 未运行"
   echo
   printf '  安装方式：bash install-wp-cluster.sh\n'
